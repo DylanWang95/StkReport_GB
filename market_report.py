@@ -7,6 +7,9 @@ from datetime import datetime, timedelta
 import pytz
 import os
 
+# --- 版本验证 ---
+print("🚀 代码版本: V3.0 (如果不显示这行，说明代码没更新成功)")
+
 # --- 股票代码配置 ---
 TICKERS = {
     '^DJI': '道琼斯指数',
@@ -62,16 +65,14 @@ def get_market_data():
     return data_list, target_date, all_closed
 
 def send_email(subject, body):
-    # --- 1. 强制清理空格和格式 ---
-    # 很多人复制 Secrets 时会多带一个空格，这会导致 QQ 报错
+    # 清理可能存在的空格
     sender = os.environ['MAIL_USERNAME'].strip()
     password = os.environ['MAIL_PASSWORD'].strip()
     receiver = os.environ['MAIL_RECEIVER'].strip()
     smtp_server = os.environ['MAIL_SERVER'].strip()
     
-    # 检查是否只填了QQ号没填后缀
+    # 自动补全后缀，防止只填了QQ号
     if '@' not in sender:
-        print(f"警告：检测到发件人 '{sender}' 没有后缀，正在自动补充 @qq.com")
         sender = sender + '@qq.com'
 
     try:
@@ -81,23 +82,21 @@ def send_email(subject, body):
 
     message = MIMEText(body, 'html', 'utf-8')
     
-    # --- 2. 使用最兼容的方式构建头部 ---
-    # 直接使用 formataddr，这是 Python 标准库推荐的方式
+    # --- 核心修复：QQ邮箱必须使用这种格式 ---
+    # 格式示例: "美股日报" <123456@qq.com>
     message['From'] = formataddr(("美股日报", sender))
     message['To'] = formataddr(("订阅者", receiver))
     message['Subject'] = Header(subject, 'utf-8')
 
-    # --- 3. 打印调试信息 ---
-    print(f"DEBUG: 发件人格式: {message['From']}")
-    print(f"DEBUG: 收件人格式: {message['To']}")
+    print(f"DEBUG: 正在尝试使用的发件人格式: {message['From']}")
     
     try:
         print(f"正在连接 {smtp_server}:{smtp_port} ...")
         
         if smtp_port == 465:
-            smtp = smtplib.SMTP_SSL(smtp_server, smtp_port)
+            smtp = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=30)
         else:
-            smtp = smtplib.SMTP(smtp_server, smtp_port)
+            smtp = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
             smtp.starttls()
         
         smtp.login(sender, password)
@@ -106,54 +105,5 @@ def send_email(subject, body):
         smtp.quit()
     except Exception as e:
         print(f"❌ 邮件发送失败: {e}")
-        print("请检查上方 DEBUG 信息中的邮箱地址是否有多余字符。")
-
-def main():
-    try:
-        data, target_date, all_closed = get_market_data()
-        
-        if all_closed:
-            print(f"{target_date} 美股休市，不发送邮件。")
-            return 
-
-        summary_text = f"当地时间{target_date}，美股" + "，".join([d['text_desc'] for d in data]) + "。"
-        
-        html_rows = ""
-        for d in data:
-            html_rows += f"""
-            <tr>
-                <td style="padding: 8px; border: 1px solid #ddd;">{d['name']}</td>
-                <td style="padding: 8px; border: 1px solid #ddd;">{d['close']}</td>
-                <td style="padding: 8px; border: 1px solid #ddd; color:{d['color']}">{d['change_amt']}</td>
-                <td style="padding: 8px; border: 1px solid #ddd; color:{d['color']}">{d['change_pct']}</td>
-            </tr>
-            """
-            
-        email_body = f"""
-        <h3>🇺🇸 美股收盘速递 ({target_date})</h3>
-        <table style="border-collapse: collapse; width: 100%; text-align: center; font-family: Arial;">
-            <thead style="background-color: #f2f2f2;">
-                <tr>
-                    <th style="padding: 8px; border: 1px solid #ddd;">指数</th>
-                    <th style="padding: 8px; border: 1px solid #ddd;">收盘</th>
-                    <th style="padding: 8px; border: 1px solid #ddd;">涨跌额</th>
-                    <th style="padding: 8px; border: 1px solid #ddd;">涨跌幅</th>
-                </tr>
-            </thead>
-            <tbody>
-                {html_rows}
-            </tbody>
-        </table>
-        <br>
-        <div style="background-color: #f9f9f9; padding: 10px; border-left: 4px solid #0366d6;">
-            <strong>📝 汇总：</strong>{summary_text}
-        </div>
-        """
-        
-        subject = f"【美股日报】{target_date} " + " ".join([d['text_desc'] for d in data])
-        send_email(subject, email_body)
-    except Exception as e:
-        print(f"主程序运行出错: {e}")
-
-if __name__ == "__main__":
-    main()
+        # 如果是 550 错误，通常是因为 Header 里的 From 和 Login 的账号不一致
+        if "550" in str(
