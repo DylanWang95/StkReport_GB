@@ -1,0 +1,33 @@
+name: US Stock Daily Report
+
+on:
+  schedule:
+    # 北京时间 06:30 = UTC 22:30 (前一天)
+    # 这里的 1-5 代表 UTC时间的周一到周五
+    # 即 北京时间的 周二到周六
+    - cron: '30 22 * * 1-5'
+  workflow_dispatch: # 这是一个手动触发按钮，方便你测试
+
+jobs:
+  run_report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code (拉取代码)
+        uses: actions/checkout@v3
+
+      - name: Set up Python (设置环境)
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies (安装依赖)
+        run: pip install -r requirements.txt
+
+      - name: Run Script (运行脚本)
+        env:
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          MAIL_RECEIVER: ${{ secrets.MAIL_RECEIVER }}
+          MAIL_SERVER: ${{ secrets.MAIL_SERVER }}
+          MAIL_PORT: ${{ secrets.MAIL_PORT }}
+        run: python market_report.py
