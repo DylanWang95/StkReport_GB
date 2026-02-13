@@ -2,6 +2,7 @@ import yfinance as yf
 import smtplib
 from email.mime.text import MIMEText
 from email.header import Header
+from email.utils import formataddr  # <--- 新增这行，专门解决 550 错误
 from datetime import datetime, timedelta
 import pytz
 import os
@@ -15,47 +16,40 @@ TICKERS = {
 
 def get_market_data():
     data_list = []
-    # 获取美东时间昨天的日期（因为我们是北京时间早上运行，看的是美国昨天收盘）
     us_eastern = pytz.timezone('US/Eastern')
     now_us = datetime.now(us_eastern)
     
-    # 获取最近5天数据，防止周末或假期数据缺失
     end_date = now_us + timedelta(days=1)
     start_date = now_us - timedelta(days=5)
     
-    # 期望的交易日是美东时间昨天
+    # 目标日期：美东时间昨天
     target_date = (now_us - timedelta(days=1)).date()
     print(f"正在获取 {target_date} (美东时间) 的数据...")
 
-    all_closed = True # 假设默认是休市
+    all_closed = True 
 
     for symbol, name in TICKERS.items():
         try:
             ticker = yf.Ticker(symbol)
-            # 获取历史数据
             df = ticker.history(start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'))
             
             if df.empty:
                 continue
                 
-            # 获取最后一行数据
             last_row = df.iloc[-1]
             last_date = last_row.name.date()
             
-            # 只有当 最新数据的日期 == 目标日期 时，才说明昨天开市了
             if last_date == target_date:
-                all_closed = False # 只要有一个数据对上了，就不是全休市
+                all_closed = False 
                 
-                # 计算数据
                 prev_close = df.iloc[-2]['Close'] if len(df) >= 2 else last_row['Open']
                 close_price = last_row['Close']
                 change_amount = close_price - prev_close
                 change_pct = (change_amount / prev_close) * 100
                 
                 status = "收涨" if change_amount > 0 else "收跌"
-                color = "#ff0000" if change_amount > 0 else "#008000" # 红涨绿跌
+                color = "#ff0000" if change_amount > 0 else "#008000" 
                 
-                # 文字描述：道指收跌1.34%
                 text_desc = f"{name}{status}{abs(change_pct):.2f}%"
                 
                 data_list.append({
@@ -76,14 +70,27 @@ def send_email(subject, body):
     password = os.environ['MAIL_PASSWORD']
     receiver = os.environ['MAIL_RECEIVER']
     smtp_server = os.environ['MAIL_SERVER']
-    smtp_port = int(os.environ['MAIL_PORT'])
+    
+    # 强制转换端口为整数
+    try:
+        smtp_port = int(os.environ['MAIL_PORT'])
+    except ValueError:
+        smtp_port = 465 # 默认值
 
     message = MIMEText(body, 'html', 'utf-8')
-    message['From'] = Header("美股日报", 'utf-8')
-    message['To'] = Header("订阅者", 'utf-8')
+    
+    # --- 关键修改开始 ---
+    # 使用 formataddr 生成标准格式: "美股日报 <xxx@qq.com>"
+    # 这能完美解决 QQ 邮箱 550 Error
+    message['From'] = formataddr(["美股日报", sender])
+    message['To'] = formataddr(["订阅者", receiver])
+    # --- 关键修改结束 ---
+    
     message['Subject'] = Header(subject, 'utf-8')
 
     try:
+        print(f"正在连接 {smtp_server}:{smtp_port} ...")
+        
         if smtp_port == 465:
             smtp = smtplib.SMTP_SSL(smtp_server, smtp_port)
         else:
@@ -96,15 +103,17 @@ def send_email(subject, body):
         smtp.quit()
     except Exception as e:
         print(f"邮件发送失败: {e}")
+        # 再次提示用户检查配置
+        if "550" in str(e):
+             print("如果是 550 错误，通常是因为发送频率过快或发件人格式问题（已在此代码中修复格式）。")
 
 def main():
     data, target_date, all_closed = get_market_data()
     
     if all_closed:
         print(f"{target_date} 美股休市，不发送邮件。")
-        return # 直接结束程序
+        return 
 
-    # 构造邮件内容
     summary_text = f"当地时间{target_date}，美股" + "，".join([d['text_desc'] for d in data]) + "。"
     
     html_rows = ""
