@@ -6,10 +6,9 @@ from email.utils import formataddr
 from datetime import datetime, timedelta
 import pytz
 import os
-import sys
+import pandas as pd # 引入pandas处理时间更稳健
 
 # --- 1. 基础配置 ---
-# 包含美股三大指数 + 欧洲三大指数
 MARKETS = {
     'US': [
         {'symbol': '^DJI',  'name': '道指', 'full_name': '美股道指'},
@@ -24,63 +23,63 @@ MARKETS = {
 }
 
 def get_target_date():
-    """
-    决定我们要抓取哪一天的数据。
-    优先级：GitHub手动输入的日期 > 环境变量 > 当前美东时间
-    """
-    # 1. 检查是否有手动输入的测试日期 (GitHub Actions Input)
+    """优先级：GitHub手动输入 > 环境变量 > 美东时间昨天"""
     input_date = os.environ.get('INPUT_TEST_DATE')
     if input_date and input_date.strip():
         try:
             target = datetime.strptime(input_date.strip(), "%Y-%m-%d").date()
-            print(f"🛠️ [手动测试模式] 正在回溯抓取历史数据: {target}")
+            print(f"🛠️ [手动测试模式] 锁定日期: {target}")
             return target
         except ValueError:
-            print("⚠️ 输入的日期格式错误，将使用实时时间。")
+            print("⚠️ 日期格式错误，切换回自动模式。")
 
-    # 2. 默认为生产模式：获取美东时间“昨天”的收盘数据
-    # (北京时间早晨6:30运行，对应美东时间前一天的下午，交易已结束)
+    # 自动模式：默认取美东时间"昨天"（因为北京早晨运行是看昨晚收盘）
     us_eastern = pytz.timezone('US/Eastern')
-    now_us = datetime.now(us_eastern)
-    # 如果是周二-周六运行，我们通常看的是"昨天"的收盘
-    # 但 yfinance 的逻辑是传入"End Date"，所以我们直接取 .date() 作为基准
-    # 比如北京周三早晨(美东周二傍晚)，我们要看周二的数据
-    return now_us.date()
+    return datetime.now(us_eastern).date()
 
 def get_market_data(symbol, target_date):
-    """
-    获取指定日期的指数数据
-    """
+    """获取指定日期的指数数据（修复时区BUG版）"""
     try:
         ticker = yf.Ticker(symbol)
-        # 宽容度：前后多取几天，防止时区导致的数据缺失
+        # 宽容度：前后多取几天
         start_date = target_date - timedelta(days=5)
-        end_date = target_date + timedelta(days=2)
+        end_date = target_date + timedelta(days=3) # 多取一点防止边界效应
         
         df = ticker.history(start=start_date, end=end_date)
         
         if df.empty:
+            # print(f"DEBUG: {symbol} 返回数据为空")
             return None
 
-        # 统一时区处理，只保留日期部分
-        try:
-            df.index = df.index.tz_convert('US/Eastern').date
-        except:
-            df.index = df.index.date
+        # --- 核心修复 ---
+        # 不要强转美东时间，而是直接取“本地日期”
+        # yfinance 的索引通常是带时区的 Timestamp，或者是 naive 的
+        # 我们统一把索引转为单纯的 date 对象 (YYYY-MM-DD)
+        df.index = [d.date() for d in df.index]
 
         # 检查目标日期是否有数据
         if target_date not in df.index:
-            return None # 这一天该市场没开盘（休市）
+            # 增加一个详细Debug，方便看看到底抓到了哪几天
+            # print(f"DEBUG: {symbol} 未找到 {target_date}。可用日期: {df.index.tolist()}")
+            return None # 真的休市
 
         # 获取数据
         target_row = df.loc[target_date]
         
-        # 寻找前一个有效交易日计算涨跌
-        past_data = df.loc[:target_date]
-        if len(past_data) < 2:
-            prev_close = target_row['Open'] 
-        else:
-            prev_close = past_data.iloc[-2]['Close']
+        # 寻找前一个有效交易日（用于计算涨跌）
+        # 这里的切片逻辑要小心，因为index已经是date对象了
+        # 我们重新通过 date 来定位
+        
+        # 找到目标日期在列表中的位置
+        all_dates = df.index.tolist()
+        try:
+            idx = all_dates.index(target_date)
+            if idx > 0:
+                prev_close = df.iloc[idx-1]['Close']
+            else:
+                prev_close = target_row['Open'] # 如果是第一天，用开盘价兜底
+        except ValueError:
+            return None
 
         close = target_row['Close']
         change_amt = close - prev_close
@@ -110,7 +109,7 @@ def main():
     target_date = get_target_date()
     print(f"🚀 开始生成报表，目标日期: {target_date}")
     
-    report_data = [] # 存表格用的详细数据
+    report_data = [] 
     
     # --- 1. 处理美股 ---
     us_phrases = []
@@ -119,22 +118,18 @@ def main():
     for m in MARKETS['US']:
         data = get_market_data(m['symbol'], target_date)
         if data:
-            # 文字：道指收跌1.20%
             text = format_change_text(m['full_name'], data)
             us_phrases.append(text)
-            
-            # 表格数据
             color = "#ff0000" if data['change_amt'] > 0 else "#008000"
             report_data.append([m['full_name'], f"{data['close']:,.2f}", f"{data['change_amt']:+.2f}", f"{data['change_pct']:+.2f}%", color])
         else:
             us_closed_count += 1
             report_data.append([m['full_name'], "-", "-", "休市", "gray"])
 
-    # 美股文字汇总逻辑
     if us_closed_count == len(MARKETS['US']):
         us_summary = "美股休市"
     else:
-        us_summary = "，".join(us_phrases)
+        us_summary = "美股" + "，".join(us_phrases)
 
     # --- 2. 处理欧股 ---
     eu_phrases = []
@@ -149,15 +144,23 @@ def main():
             report_data.append([m['full_name'], f"{data['close']:,.2f}", f"{data['change_amt']:+.2f}", f"{data['change_pct']:+.2f}%", color])
         else:
             eu_closed_count += 1
-            # 欧洲如果是个别休市，要明确写出来，例如"英国休市"
+            # 只有当该国确实休市时，才显示“英国休市”
+            # 为防止误判，我们这里只记录，不立即加文字，除非是混合情况
             eu_phrases.append(f"{m['country']}休市")
             report_data.append([m['full_name'], "-", "-", "休市", "gray"])
 
     # 欧股文字汇总逻辑
+    # 过滤掉 "XX休市" 的文本，只保留有数据的，除非全部休市
+    valid_eu_phrases = [p for p in eu_phrases if "休市" not in p]
+    
     if eu_closed_count == len(MARKETS['EU']):
-        eu_summary = "欧洲方面休市" # 只有全休市才这么说
+        eu_summary = "欧洲方面休市"
+    elif len(valid_eu_phrases) > 0:
+        # 混合状态：有开有停。
+        # 比如：英国休市，法国涨...
+        eu_summary = "欧洲方面，" + "，".join(eu_phrases) # 这里保留"英国休市"这种描述
     else:
-        eu_summary = "欧洲方面，" + "，".join(eu_phrases)
+         eu_summary = "欧洲方面，" + "，".join(eu_phrases)
 
     # --- 3. 全局判断 ---
     total_markets = len(MARKETS['US']) + len(MARKETS['EU'])
@@ -166,16 +169,12 @@ def main():
         return
 
     # --- 4. 生成最终文案 ---
-    # 格式要求：2026年2月5日 (去掉0)
     date_str = f"{target_date.year}年{target_date.month}月{target_date.day}日"
-    
-    # 拼接：境外股市运行情况。当地时间X日，[美股部分]。[欧股部分]。
     final_text = f"境外股市运行情况。当地时间{date_str}，{us_summary}。{eu_summary}。"
     
     print("\n生成的文字摘要：")
     print(final_text)
 
-    # --- 5. 发送邮件 ---
     send_email_html(target_date, final_text, report_data)
 
 def send_email_html(date_obj, summary, table_rows):
@@ -189,10 +188,8 @@ def send_email_html(date_obj, summary, table_rows):
     except:
         smtp_port = 587
 
-    # 生成HTML行
     html_content = ""
     for row in table_rows:
-        # row: [Name, Close, Amt, Pct, Color]
         html_content += f"""
         <tr>
             <td style="padding:8px;border:1px solid #ddd;">{row[0]}</td>
@@ -228,6 +225,7 @@ def send_email_html(date_obj, summary, table_rows):
     msg['Subject'] = Header(f"【股市日报】{summary[:30]}...", 'utf-8')
 
     try:
+        print(f"正在连接 {smtp_server}:{smtp_port} ...")
         server = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
         server.starttls()
         server.login(sender, password)
