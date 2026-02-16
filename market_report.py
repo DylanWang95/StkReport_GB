@@ -6,7 +6,7 @@ from email.utils import formataddr
 from datetime import datetime, timedelta
 import pytz
 import os
-import pandas as pd # 引入pandas处理时间更稳健
+import pandas as pd
 
 # --- 1. 基础配置 ---
 MARKETS = {
@@ -23,7 +23,7 @@ MARKETS = {
 }
 
 def get_target_date():
-    """优先级：GitHub手动输入 > 环境变量 > 美东时间昨天"""
+    """获取目标日期：优先使用手动输入，否则使用自动逻辑"""
     input_date = os.environ.get('INPUT_TEST_DATE')
     if input_date and input_date.strip():
         try:
@@ -33,51 +33,38 @@ def get_target_date():
         except ValueError:
             print("⚠️ 日期格式错误，切换回自动模式。")
 
-    # 自动模式：默认取美东时间"昨天"（因为北京早晨运行是看昨晚收盘）
+    # 自动模式：默认取美东时间"昨天"
     us_eastern = pytz.timezone('US/Eastern')
     return datetime.now(us_eastern).date()
 
 def get_market_data(symbol, target_date):
-    """获取指定日期的指数数据（修复时区BUG版）"""
+    """获取指定日期的指数数据"""
     try:
         ticker = yf.Ticker(symbol)
-        # 宽容度：前后多取几天
         start_date = target_date - timedelta(days=5)
-        end_date = target_date + timedelta(days=3) # 多取一点防止边界效应
+        end_date = target_date + timedelta(days=3)
         
         df = ticker.history(start=start_date, end=end_date)
         
         if df.empty:
-            # print(f"DEBUG: {symbol} 返回数据为空")
             return None
 
-        # --- 核心修复 ---
-        # 不要强转美东时间，而是直接取“本地日期”
-        # yfinance 的索引通常是带时区的 Timestamp，或者是 naive 的
-        # 我们统一把索引转为单纯的 date 对象 (YYYY-MM-DD)
+        # 核心逻辑：直接使用本地日期，不进行时区强转，防止欧股数据丢失
         df.index = [d.date() for d in df.index]
 
-        # 检查目标日期是否有数据
         if target_date not in df.index:
-            # 增加一个详细Debug，方便看看到底抓到了哪几天
-            # print(f"DEBUG: {symbol} 未找到 {target_date}。可用日期: {df.index.tolist()}")
-            return None # 真的休市
+            return None # 这一天该市场没开盘（休市）
 
-        # 获取数据
         target_row = df.loc[target_date]
         
-        # 寻找前一个有效交易日（用于计算涨跌）
-        # 这里的切片逻辑要小心，因为index已经是date对象了
-        # 我们重新通过 date 来定位
-        
-        # 找到目标日期在列表中的位置
+        # 寻找前一个有效交易日计算涨跌
         all_dates = df.index.tolist()
         try:
             idx = all_dates.index(target_date)
             if idx > 0:
                 prev_close = df.iloc[idx-1]['Close']
             else:
-                prev_close = target_row['Open'] # 如果是第一天，用开盘价兜底
+                prev_close = target_row['Open']
         except ValueError:
             return None
 
@@ -107,6 +94,9 @@ def format_change_text(name, data):
 
 def main():
     target_date = get_target_date()
+    # 格式化日期字符串：2026年2月5日 (用于标题和正文)
+    date_str_cn = f"{target_date.year}年{target_date.month}月{target_date.day}日"
+    
     print(f"🚀 开始生成报表，目标日期: {target_date}")
     
     report_data = [] 
@@ -124,10 +114,11 @@ def main():
             report_data.append([m['full_name'], f"{data['close']:,.2f}", f"{data['change_amt']:+.2f}", f"{data['change_pct']:+.2f}%", color])
         else:
             us_closed_count += 1
-            report_data.append([m['full_name'], "-", "-", "休市", "gray"])
+            # 表格里显示“因节假日休市”
+            report_data.append([m['full_name'], "-", "-", "因节假日休市", "gray"])
 
     if us_closed_count == len(MARKETS['US']):
-        us_summary = "美股休市"
+        us_summary = "美股因节假日休市"
     else:
         us_summary = "美股" + "，".join(us_phrases)
 
@@ -144,40 +135,35 @@ def main():
             report_data.append([m['full_name'], f"{data['close']:,.2f}", f"{data['change_amt']:+.2f}", f"{data['change_pct']:+.2f}%", color])
         else:
             eu_closed_count += 1
-            # 只有当该国确实休市时，才显示“英国休市”
-            # 为防止误判，我们这里只记录，不立即加文字，除非是混合情况
-            eu_phrases.append(f"{m['country']}休市")
-            report_data.append([m['full_name'], "-", "-", "休市", "gray"])
+            # 文字描述改为：英国因节假日休市
+            eu_phrases.append(f"{m['country']}因节假日休市")
+            report_data.append([m['full_name'], "-", "-", "因节假日休市", "gray"])
 
     # 欧股文字汇总逻辑
-    # 过滤掉 "XX休市" 的文本，只保留有数据的，除非全部休市
-    valid_eu_phrases = [p for p in eu_phrases if "休市" not in p]
-    
     if eu_closed_count == len(MARKETS['EU']):
-        eu_summary = "欧洲方面休市"
-    elif len(valid_eu_phrases) > 0:
-        # 混合状态：有开有停。
-        # 比如：英国休市，法国涨...
-        eu_summary = "欧洲方面，" + "，".join(eu_phrases) # 这里保留"英国休市"这种描述
+        eu_summary = "欧洲方面因节假日休市"
     else:
-         eu_summary = "欧洲方面，" + "，".join(eu_phrases)
+        eu_summary = "欧洲方面，" + "，".join(eu_phrases)
 
     # --- 3. 全局判断 ---
     total_markets = len(MARKETS['US']) + len(MARKETS['EU'])
     if us_closed_count + eu_closed_count == total_markets:
-        print(f"💤 {target_date} 全球主要市场均休市，无需发送邮件。")
+        print(f"💤 {target_date} 全球主要市场均因节假日休市，无需发送邮件。")
         return
 
     # --- 4. 生成最终文案 ---
-    date_str = f"{target_date.year}年{target_date.month}月{target_date.day}日"
-    final_text = f"境外股市运行情况。当地时间{date_str}，{us_summary}。{eu_summary}。"
+    # 格式：境外股市运行情况。当地时间2026年2月5日，美股...。欧洲方面...。
+    final_text = f"境外股市运行情况。当地时间{date_str_cn}，{us_summary}。{eu_summary}。"
     
     print("\n生成的文字摘要：")
     print(final_text)
 
-    send_email_html(target_date, final_text, report_data)
+    # 邮件标题：境外股市运行情况-2026年2月5日
+    subject = f"境外股市运行情况-{date_str_cn}"
+    
+    send_email_html(subject, final_text, report_data, date_str_cn)
 
-def send_email_html(date_obj, summary, table_rows):
+def send_email_html(subject, summary, table_rows, date_str):
     sender = os.environ['MAIL_USERNAME'].strip()
     password = os.environ['MAIL_PASSWORD'].strip()
     receiver = os.environ['MAIL_RECEIVER'].strip()
@@ -201,7 +187,7 @@ def send_email_html(date_obj, summary, table_rows):
 
     email_body = f"""
     <div style="font-family:Arial;color:#333;">
-        <h3>🌍 境外股市日报 ({date_obj})</h3>
+        <h3>🌍 境外股市日报 ({date_str})</h3>
         <div style="background:#f4f4f4;padding:15px;border-left:5px solid #0366d6;margin-bottom:20px;">
             <strong>📝 文字汇总：</strong><br>{summary}
         </div>
@@ -220,9 +206,9 @@ def send_email_html(date_obj, summary, table_rows):
     """
 
     msg = MIMEText(email_body, 'html', 'utf-8')
-    msg['From'] = formataddr(("股市助手", sender))
+    msg['From'] = formataddr(("境外股市情况", sender))
     msg['To'] = formataddr(("订阅者", receiver))
-    msg['Subject'] = Header(f"【股市日报】{summary[:30]}...", 'utf-8')
+    msg['Subject'] = Header(subject, 'utf-8')
 
     try:
         print(f"正在连接 {smtp_server}:{smtp_port} ...")
