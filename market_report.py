@@ -164,6 +164,7 @@ def main():
     send_email_html(subject, final_text, report_data, date_str_cn)
 
 def send_email_html(subject, summary, table_rows, date_str):
+    # 获取环境变量
     sender = os.environ['MAIL_USERNAME'].strip()
     password = os.environ['MAIL_PASSWORD'].strip()
     receiver = os.environ['MAIL_RECEIVER'].strip()
@@ -174,38 +175,33 @@ def send_email_html(subject, summary, table_rows, date_str):
     except:
         smtp_port = 587
 
-    html_content = ""
-    for row in table_rows:
-        html_content += f"""
-        <tr>
-            <td style="padding:8px;border:1px solid #ddd;">{row[0]}</td>
-            <td style="padding:8px;border:1px solid #ddd;">{row[1]}</td>
-            <td style="padding:8px;border:1px solid #ddd;color:{row[4]}">{row[2]}</td>
-            <td style="padding:8px;border:1px solid #ddd;color:{row[4]}">{row[3]}</td>
-        </tr>
-        """
+    # ================= 修改开始 =================
+    
+    # 1. 注释掉表格生成逻辑 (这部分不需要了)
+    # html_content = ""
+    # for row in table_rows:
+    #     html_content += f"""
+    #     <tr>
+    #         <td style="padding:8px;border:1px solid #ddd;">{row[0]}</td>
+    #         <td style="padding:8px;border:1px solid #ddd;">{row[1]}</td>
+    #         <td style="padding:8px;border:1px solid #ddd;color:{row[4]}">{row[2]}</td>
+    #         <td style="padding:8px;border:1px solid #ddd;color:{row[4]}">{row[3]}</td>
+    #     </tr>
+    #     """
 
+    # 2. 重新设计简洁版邮件正文 (只包含文字汇总)
+    # 我们把字体稍微调大一点 (16px)，方便阅读
     email_body = f"""
-    <div style="font-family:Arial;color:#333;">
-        <h3>🌍 境外股市日报 ({date_str})</h3>
-        <div style="background:#f4f4f4;padding:15px;border-left:5px solid #0366d6;margin-bottom:20px;">
-            <strong>📝 文字汇总：</strong><br>{summary}
-        </div>
-        <table style="border-collapse:collapse;width:100%;text-align:center;font-size:14px;">
-            <thead style="background:#0366d6;color:white;">
-                <tr>
-                    <th style="padding:10px;">指数</th>
-                    <th style="padding:10px;">收盘</th>
-                    <th style="padding:10px;">涨跌额</th>
-                    <th style="padding:10px;">涨跌幅</th>
-                </tr>
-            </thead>
-            <tbody>{html_content}</tbody>
-        </table>
+    <div style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; color: #333; line-height: 1.8; font-size: 16px;">
+        <p>{summary}</p>
     </div>
     """
+    
+    # ================= 修改结束 =================
 
     msg = MIMEText(email_body, 'html', 'utf-8')
+    
+    # 这里顺便帮你把发件人名字改成了你想要的 "境外股市情况"
     msg['From'] = formataddr(("境外股市情况", sender))
     msg['To'] = formataddr(("订阅者", receiver))
     msg['Subject'] = Header(subject, 'utf-8')
