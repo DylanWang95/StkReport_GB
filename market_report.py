@@ -164,46 +164,36 @@ def main():
     send_email_html(subject, final_text, report_data, date_str_cn)
 
 def send_email_html(subject, summary, table_rows, date_str):
-    # 获取环境变量
     sender = os.environ['MAIL_USERNAME'].strip()
     password = os.environ['MAIL_PASSWORD'].strip()
-    receiver = os.environ['MAIL_RECEIVER'].strip()
     smtp_server = os.environ['MAIL_SERVER'].strip()
+    
+    # --- 1. 处理多收件人逻辑 ---
+    # 获取字符串，按逗号分割，并清理空格
+    receivers_str = os.environ['MAIL_RECEIVER']
+    receivers = [r.strip() for r in receivers_str.split(',') if r.strip()]
     
     try:
         smtp_port = int(os.environ['MAIL_PORT'])
     except:
         smtp_port = 587
 
-    # ================= 修改开始 =================
-    
-    # 1. 注释掉表格生成逻辑 (这部分不需要了)
-    # html_content = ""
-    # for row in table_rows:
-    #     html_content += f"""
-    #     <tr>
-    #         <td style="padding:8px;border:1px solid #ddd;">{row[0]}</td>
-    #         <td style="padding:8px;border:1px solid #ddd;">{row[1]}</td>
-    #         <td style="padding:8px;border:1px solid #ddd;color:{row[4]}">{row[2]}</td>
-    #         <td style="padding:8px;border:1px solid #ddd;color:{row[4]}">{row[3]}</td>
-    #     </tr>
-    #     """
-
-    # 2. 重新设计简洁版邮件正文 (只包含文字汇总)
-    # 我们把字体稍微调大一点 (16px)，方便阅读
+    # --- 2. 邮件正文 (纯文字版) ---
     email_body = f"""
     <div style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; color: #333; line-height: 1.8; font-size: 16px;">
         <p>{summary}</p>
     </div>
     """
-    
-    # ================= 修改结束 =================
 
     msg = MIMEText(email_body, 'html', 'utf-8')
     
-    # 这里顺便帮你把发件人名字改成了你想要的 "境外股市情况"
+    # 发件人显示名
     msg['From'] = formataddr(("境外股市情况", sender))
-    msg['To'] = formataddr(("订阅者", receiver))
+    
+    # 收件人显示名：为了美观，邮件头里可以只显示“订阅者群组”或者把所有人都列出来
+    # 这里我们选择将所有收件人拼接显示，这样大家知道发给了谁
+    msg['To'] = ",".join(receivers)
+    
     msg['Subject'] = Header(subject, 'utf-8')
 
     try:
@@ -211,9 +201,14 @@ def send_email_html(subject, summary, table_rows, date_str):
         server = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
         server.starttls()
         server.login(sender, password)
-        server.sendmail(sender, receiver, msg.as_string())
+        
+        # --- 3. 这里的 sendmail 必须传入 list (列表) ---
+        # 只要 receivers 是一个列表 ['a@a.com', 'b@b.com']，它就会发给所有人
+        print(f"正在发送给 {len(receivers)} 位收件人...")
+        server.sendmail(sender, receivers, msg.as_string())
+        
         server.quit()
-        print("✅ 邮件发送成功！")
+        print("✅ 邮件群发成功！")
     except Exception as e:
         print(f"❌ 发送失败: {e}")
 
