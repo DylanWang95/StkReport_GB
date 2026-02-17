@@ -1,17 +1,14 @@
 name: US Stock Daily Report
 
 on:
-  # 1. 定时任务：北京时间周二至周六 06:30 (UTC 22:30)
+  # 1. 定时任务
+  # 北京时间 07:10 = UTC 23:10 (前一天)
   schedule:
-    - cron: '30 22 * * 1-5'
+    - cron: '05 23 * * *'
   
-  # 2. 手动触发按钮 (带输入框)
+  # 2. 手动触发按钮 (无输入框版)
+  # 点击后直接运行，不再弹窗询问日期
   workflow_dispatch:
-    inputs:
-      test_date:
-        description: '【测试用】输入日期 (格式 YYYY-MM-DD)，留空则为今天'
-        required: false
-        default: ''
 
 jobs:
   run_report:
@@ -35,6 +32,6 @@ jobs:
           MAIL_RECEIVER: ${{ secrets.MAIL_RECEIVER }}
           MAIL_SERVER: ${{ secrets.MAIL_SERVER }}
           MAIL_PORT: ${{ secrets.MAIL_PORT }}
-          # 将手动输入的日期传入环境变量
-          INPUT_TEST_DATE: ${{ github.event.inputs.test_date }}
+          # 注意：这里删除了 INPUT_TEST_DATE 变量
+          # Python 脚本读取不到这个变量时，会自动进入“自动获取当天数据”模式
         run: python market_report.py
