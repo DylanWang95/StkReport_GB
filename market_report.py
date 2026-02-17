@@ -11,7 +11,7 @@ import pandas as pd
 # --- 1. 基础配置 ---
 MARKETS = {
     'US': [
-        {'symbol': '^DJI',  'name': '道指', 'full_name': '美股道指'},
+        {'symbol': '^DJI',  'name': '道指', 'full_name': '道指'},
         {'symbol': '^GSPC', 'name': '标普500', 'full_name': '标普500指数'},
         {'symbol': '^IXIC', 'name': '纳指', 'full_name': '纳指'}
     ],
