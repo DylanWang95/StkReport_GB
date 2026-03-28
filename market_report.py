@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 import pytz
 import os
 import pandas as pd
+import time
+
 
 # --- 1. 基础配置 ---
 MARKETS = {
@@ -38,49 +40,58 @@ def get_target_date():
     return datetime.now(us_eastern).date()
 
 def get_market_data(symbol, target_date):
-    """获取指定日期的指数数据"""
-    try:
-        ticker = yf.Ticker(symbol)
-        start_date = target_date - timedelta(days=5)
-        end_date = target_date + timedelta(days=3)
-        
-        df = ticker.history(start=start_date, end=end_date)
-        
-        if df.empty:
-            return None
-
-        # 核心逻辑：直接使用本地日期，不进行时区强转，防止欧股数据丢失
-        df.index = [d.date() for d in df.index]
-
-        if target_date not in df.index:
-            return None # 这一天该市场没开盘（休市）
-
-        target_row = df.loc[target_date]
-        
-        # 寻找前一个有效交易日计算涨跌
-        all_dates = df.index.tolist()
+    """获取指定日期的指数数据（增加抗网络波动的重试机制）"""
+    # --- 核心修复：最多尝试 3 次，防止 Yahoo 临时封锁或网络抖动 ---
+    for attempt in range(3):
         try:
-            idx = all_dates.index(target_date)
-            if idx > 0:
-                prev_close = df.iloc[idx-1]['Close']
-            else:
-                prev_close = target_row['Open']
-        except ValueError:
-            return None
+            ticker = yf.Ticker(symbol)
+            start_date = target_date - timedelta(days=5)
+            end_date = target_date + timedelta(days=3)
+            
+            df = ticker.history(start=start_date, end=end_date)
+            
+            # 如果获取为空，可能被 Yahoo 临时拦截，等待2秒后重试
+            if df.empty:
+                print(f"⚠️ [{attempt+1}/3] {symbol} 返回为空，可能是接口限制，2秒后重试...")
+                time.sleep(2)
+                continue
 
-        close = target_row['Close']
-        change_amt = close - prev_close
-        change_pct = (change_amt / prev_close) * 100
-        
-        return {
-            'close': close,
-            'change_amt': change_amt,
-            'change_pct': change_pct
-        }
+            # 核心逻辑：直接使用本地日期，不进行时区强转
+            df.index = [d.date() for d in df.index]
 
-    except Exception as e:
-        print(f"获取 {symbol} 失败: {e}")
-        return None
+            # 如果数据有返回，但日历里没有目标日期，说明是真的休市，直接判定
+            if target_date not in df.index:
+                print(f"💡 {symbol} 正常获取，但无 {target_date} 交易记录，确认为休市。")
+                return None 
+
+            target_row = df.loc[target_date]
+            
+            all_dates = df.index.tolist()
+            try:
+                idx = all_dates.index(target_date)
+                if idx > 0:
+                    prev_close = df.iloc[idx-1]['Close']
+                else:
+                    prev_close = target_row['Open']
+            except ValueError:
+                return None
+
+            close = target_row['Close']
+            change_amt = close - prev_close
+            change_pct = (change_amt / prev_close) * 100
+            
+            return {
+                'close': close,
+                'change_amt': change_amt,
+                'change_pct': change_pct
+            }
+
+        except Exception as e:
+            print(f"❌ [{attempt+1}/3] 获取 {symbol} 发生异常: {e}")
+            time.sleep(2) # 报错也等2秒再试
+
+    print(f"🚨 {symbol} 连续 3 次获取失败，需要人工检验。")
+    return None
 
 def format_change_text(name, data):
     """生成：'道指收跌1.20%' """
