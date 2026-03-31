@@ -24,7 +24,7 @@ MARKETS = {
     ]
 }
 
-# --- 2. 核心数据架构 (16字段宽表) ---
+# --- 2. 核心数据架构 (17字段宽表) ---
 @dataclass
 class MarketRecord:
     # 1. 元数据层
@@ -46,7 +46,8 @@ class MarketRecord:
     calc_snap_pct: Optional[float] = None
     calc_hybrid_pct: Optional[float] = None
     diff_hist_vs_snap: Optional[float] = None
-    diff_hist_pct_vs_hybrid_pct: Optional[float] = None # 你新增的指标
+    diff_hist_pct_vs_hybrid_pct: Optional[float] = None 
+    diff_hist_prev_vs_snap_prev: Optional[float] = None # 【新增】：昨收价漂移率
     
     # 5. 仲裁结果层
     final_status: str = "PENDING"
@@ -58,17 +59,19 @@ class MarketRecord:
         print(f"\n[{self.index_name}] 📊 --- 核心数据宽表 (Data Record) ---")
         print(f"  [Meta] 目标日: {self.target_date}")
         print(f"  [Hist] T日收盘: {self.hist_t_close} | T-1日({self.hist_t1_date}): {self.hist_t1_close}")
-        print(f"  [Snap] 真实戳: {self.snap_date} | 最新: {self.snap_last_price} | 自带昨收: {self.snap_prev_close}")
+        
+        # 【新增打印】：将昨收差值率接在 Snap 打印行后方
+        diff_prev_p = f"{self.diff_hist_prev_vs_snap_prev*100:.4f}%" if self.diff_hist_prev_vs_snap_prev is not None else "None"
+        print(f"  [Snap] 真实戳: {self.snap_date} | 最新: {self.snap_last_price} | 自带昨收: {self.snap_prev_close} | 昨收差异率: {diff_prev_p}")
         
         # 格式化百分比显示
         hp = f"{self.calc_hist_pct*100:+.4f}%" if self.calc_hist_pct is not None else "None"
-        sp = f"{self.calc_snap_pct*100:+.4f}%" if self.calc_snap_pct is not None else "None"
         hyp = f"{self.calc_hybrid_pct*100:+.4f}%" if self.calc_hybrid_pct is not None else "None"
         diff_p = f"{self.diff_hist_pct_vs_hybrid_pct*100:+.4f}%" if self.diff_hist_pct_vs_hybrid_pct is not None else "None"
         
-        print(f"  [Calc] 纯历史涨幅: {hp} | 跨源混合涨幅: {hyp} | 差值(历史-混合): {diff_p}")
+        print(f"  [Calc] 纯历史涨幅: {hp} | 跨源混合涨幅: {hyp} | 涨幅差值(历史-混合): {diff_p}")
         print(f"  [Output] 🏁 仲裁状态: {self.final_status}")
-        print("-" * 55)
+        print("-" * 65)
 
 def get_us_eastern_target_date():
     """获取绝对的交易目标日期 (美东锚点)"""
@@ -97,7 +100,6 @@ def process_market(market_info, target_date):
     print(f"🔍 启动双擎流水线: {name} ({symbol}) | 目标: {target_date}")
     print("="*50)
     
-    # 初始化数据结构
     rec = MarketRecord(index_name=name, target_date=target_date)
     ticker = yf.Ticker(symbol)
     
@@ -112,7 +114,6 @@ def process_market(market_info, target_date):
             df.index = [d.date() for d in df.index]
             all_dates = df.index.tolist()
             
-            # 如果目标日在库里 (完美情况)
             if target_date in all_dates:
                 rec.hist_t_close = float(df.loc[target_date]['Close'])
                 idx = all_dates.index(target_date)
@@ -121,7 +122,6 @@ def process_market(market_info, target_date):
                     rec.hist_t1_close = float(df.iloc[idx-1]['Close'])
                 print(f"[{name}] 🟢 历史库: 完美拉取 T 日与 T-1 日数据。")
             else:
-                # 【关键修复】如果目标日缺失(日结延迟)，我们必须把库里最新的那一天作为 T-1，为混合缝合做准备！
                 past_dates = [d for d in all_dates if d < target_date]
                 if past_dates:
                     rec.hist_t1_date = past_dates[-1]
@@ -154,7 +154,7 @@ def process_market(market_info, target_date):
     if rec.snap_last_price is not None and rec.snap_prev_close is not None:
         rec.calc_snap_pct = (rec.snap_last_price - rec.snap_prev_close) / rec.snap_prev_close
         
-    # 3. 跨源混合涨跌幅 (你的核心逻辑)
+    # 3. 跨源混合涨跌幅
     if rec.snap_last_price is not None and rec.hist_t1_close is not None:
         rec.calc_hybrid_pct = (rec.snap_last_price - rec.hist_t1_close) / rec.hist_t1_close
 
@@ -162,10 +162,15 @@ def process_market(market_info, target_date):
     if rec.hist_t_close is not None and rec.snap_last_price is not None:
         rec.diff_hist_vs_snap = abs(rec.hist_t_close - rec.snap_last_price) / rec.hist_t_close
 
-    # 5. 涨跌幅偏差 (你的新增逻辑：历史计算的涨幅 vs 混合计算的涨幅差值)
+    # 5. 涨跌幅偏差
     if rec.calc_hist_pct is not None and rec.calc_hybrid_pct is not None:
         rec.diff_hist_pct_vs_hybrid_pct = rec.calc_hist_pct - rec.calc_hybrid_pct
-
+        
+    # 6. 【新增】昨收价漂移率 (监控除权除息导致的雅虎后台数据修正幅度)
+    if rec.hist_t1_close is not None and rec.snap_prev_close is not None:
+        # 为了防止极小概率的分母为0异常
+        if rec.hist_t1_close != 0:
+            rec.diff_hist_prev_vs_snap_prev = abs(rec.hist_t1_close - rec.snap_prev_close) / rec.hist_t1_close
 
     # ---------------------------------------------------------
     # Stage 3: 智能仲裁 (Arbitrate - 四道门决策树)
@@ -173,7 +178,6 @@ def process_market(market_info, target_date):
     
     # 第一道门：完美的历史数据
     if rec.hist_t_close is not None:
-        # 如果快照也存在，检查一下是否产生严重分歧
         if rec.snap_last_price is not None and rec.snap_date == rec.target_date:
             if rec.diff_hist_vs_snap > 0.001:
                 rec.final_status = "MISMATCH_ERROR"
@@ -182,35 +186,33 @@ def process_market(market_info, target_date):
                 rec.final_close = rec.hist_t_close
                 rec.final_change_pct = rec.calc_hist_pct
         else:
-            # 快照失效无所谓，历史库完美就行
             rec.final_status = "MATCH_HISTORY"
             rec.final_close = rec.hist_t_close
             rec.final_change_pct = rec.calc_hist_pct
 
-    # 第二道门：触发跨源缝合 (历史无T日，但有T-1日，且快照戳确认是今天)
+    # 第二道门：触发跨源缝合
     elif rec.hist_t_close is None and rec.hist_t1_close is not None and rec.snap_date == rec.target_date:
         rec.final_status = "HYBRID_FALLBACK"
         rec.final_close = rec.snap_last_price
         rec.final_change_pct = rec.calc_hybrid_pct
         
-    # 第三道门：极致兜底 (历史库全崩，连昨天数据都没了，只能用纯快照)
+    # 第三道门：极致兜底
     elif rec.hist_t_close is None and rec.hist_t1_close is None and rec.snap_date == rec.target_date:
         rec.final_status = "PURE_SNAPSHOT"
         rec.final_close = rec.snap_last_price
         rec.final_change_pct = rec.calc_snap_pct
         
-    # 第四道门：确认休市 (历史无T日，且快照还停留在过去)
+    # 第四道门：确认休市
     elif rec.hist_t_close is None and (rec.snap_date is None or rec.snap_date < rec.target_date):
         rec.final_status = "HOLIDAY"
         
     else:
         rec.final_status = "UNKNOWN_ERROR"
 
-    # 打印最终宽表日志
     rec.print_record()
     return rec
 
-# --- 辅助与发送函数保持不变 ---
+# --- 辅助与发送函数 ---
 def format_change_text(name, change_amt, change_pct):
     status = "收涨" if change_amt > 0 else "收跌" if change_amt < 0 else "收平"
     return f"{name}{status}{abs(change_pct)*100:.2f}%"
@@ -234,7 +236,6 @@ def main():
             global_mismatch_flag = True
             
         if rec.final_status in ["MATCH_HISTORY", "HYBRID_FALLBACK", "PURE_SNAPSHOT"]:
-            # 为了表格着色和文字，简单计算出绝对变化额
             change_amt = rec.final_close - (rec.final_close / (1 + rec.final_change_pct))
             text = format_change_text(m['full_name'], change_amt, rec.final_change_pct)
             us_phrases.append(text)
