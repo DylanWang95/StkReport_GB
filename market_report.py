@@ -3,10 +3,12 @@ import smtplib
 from email.mime.text import MIMEText
 from email.header import Header
 from email.utils import formataddr
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta
 import pytz
 import os
 import sys
+from dataclasses import dataclass
+from typing import Optional
 
 # --- 1. 基础配置 ---
 MARKETS = {
@@ -22,197 +24,202 @@ MARKETS = {
     ]
 }
 
+# --- 2. 核心数据架构 (16字段宽表) ---
+@dataclass
+class MarketRecord:
+    # 1. 元数据层
+    index_name: str
+    target_date: datetime.date
+    
+    # 2. Engine A: 历史事实层
+    hist_t_close: Optional[float] = None
+    hist_t1_date: Optional[datetime.date] = None
+    hist_t1_close: Optional[float] = None
+    
+    # 3. Engine B: 快照事实层
+    snap_date: Optional[datetime.date] = None
+    snap_last_price: Optional[float] = None
+    snap_prev_close: Optional[float] = None
+    
+    # 4. 衍生计算层
+    calc_hist_pct: Optional[float] = None
+    calc_snap_pct: Optional[float] = None
+    calc_hybrid_pct: Optional[float] = None
+    diff_hist_vs_snap: Optional[float] = None
+    diff_hist_pct_vs_hybrid_pct: Optional[float] = None # 你新增的指标
+    
+    # 5. 仲裁结果层
+    final_status: str = "PENDING"
+    final_close: Optional[float] = None
+    final_change_pct: Optional[float] = None
+
+    def print_record(self):
+        """格式化打印这条宽表记录，便于一目了然地查错"""
+        print(f"\n[{self.index_name}] 📊 --- 核心数据宽表 (Data Record) ---")
+        print(f"  [Meta] 目标日: {self.target_date}")
+        print(f"  [Hist] T日收盘: {self.hist_t_close} | T-1日({self.hist_t1_date}): {self.hist_t1_close}")
+        print(f"  [Snap] 真实戳: {self.snap_date} | 最新: {self.snap_last_price} | 自带昨收: {self.snap_prev_close}")
+        
+        # 格式化百分比显示
+        hp = f"{self.calc_hist_pct*100:+.4f}%" if self.calc_hist_pct is not None else "None"
+        sp = f"{self.calc_snap_pct*100:+.4f}%" if self.calc_snap_pct is not None else "None"
+        hyp = f"{self.calc_hybrid_pct*100:+.4f}%" if self.calc_hybrid_pct is not None else "None"
+        diff_p = f"{self.diff_hist_pct_vs_hybrid_pct*100:+.4f}%" if self.diff_hist_pct_vs_hybrid_pct is not None else "None"
+        
+        print(f"  [Calc] 纯历史涨幅: {hp} | 跨源混合涨幅: {hyp} | 差值(历史-混合): {diff_p}")
+        print(f"  [Output] 🏁 仲裁状态: {self.final_status}")
+        print("-" * 55)
+
 def get_us_eastern_target_date():
-    """
-    步骤1：锁定绝对时间锚点 (强制基于美东时间)
-    """
+    """获取绝对的交易目标日期 (美东锚点)"""
     input_date = os.environ.get('INPUT_TEST_DATE')
     if input_date and input_date.strip():
         try:
-            target = datetime.strptime(input_date.strip(), "%Y-%m-%d").date()
-            print(f"🛠️ [手动测试模式] 锁定日期: {target}")
-            return target
-        except ValueError:
-            pass
+            return datetime.strptime(input_date.strip(), "%Y-%m-%d").date()
+        except ValueError: pass
 
-    # 获取当前的美东时间
     us_eastern = pytz.timezone('US/Eastern')
     now_est = datetime.now(us_eastern)
     target_date = now_est.date()
     
-    # 如果美东时间当前是周六或周日，则目标交易日自动回退到周五
-    if now_est.weekday() == 5: # 周六
-        target_date -= timedelta(days=1)
-    elif now_est.weekday() == 6: # 周日
-        target_date -= timedelta(days=2)
+    if now_est.weekday() == 5: target_date -= timedelta(days=1)
+    elif now_est.weekday() == 6: target_date -= timedelta(days=2)
 
-    print(f"⏱️ 运行环境时间: 本地={datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 美东={now_est.strftime('%Y-%m-%d %H:%M:%S')}")
     return target_date
 
-def get_market_data_dual_engine(market_info, target_date):
-    """
-    步骤2 & 3 & 4：双擎拉取与状态仲裁 (附带详尽过程打印)
-    """
+def process_market(market_info, target_date):
+    """三段式流控：采掘 (Fetch) -> 衍生计算 (Compute) -> 仲裁 (Arbitrate)"""
     symbol = market_info['symbol']
     name = market_info['name']
     market_tz = pytz.timezone(market_info['tz'])
     
     print(f"\n" + "="*50)
-    print(f"🔍 开始双擎校验处理: {name} ({symbol}) | 目标日期: {target_date}")
+    print(f"🔍 启动双擎流水线: {name} ({symbol}) | 目标: {target_date}")
     print("="*50)
     
+    # 初始化数据结构
+    rec = MarketRecord(index_name=name, target_date=target_date)
     ticker = yf.Ticker(symbol)
-    hist_data = None
-    snap_data = None
     
-    # ==========================================
-    # Engine A: 历史数据库 (History)
-    # ==========================================
+    # ---------------------------------------------------------
+    # Stage 1: 盲目采掘 (Fetch Raw Data)
+    # ---------------------------------------------------------
+    
+    # [Engine A: History]
     try:
-        start_date = target_date - timedelta(days=5)
-        end_date = target_date + timedelta(days=3)
-        print(f"[{name}] 🟢 Engine A (历史库): 发起API请求，拉取窗口: {start_date} 至 {end_date}")
-        df = ticker.history(start=start_date, end=end_date)
-        
+        df = ticker.history(start=target_date - timedelta(days=5), end=target_date + timedelta(days=3))
         if not df.empty:
             df.index = [d.date() for d in df.index]
+            all_dates = df.index.tolist()
             
-            # --- 打印历史库提取的原始序列 ---
-            print(f"[{name}]   📊 历史库返回的有效交易日序列:")
-            for d, row in df.iterrows():
-                marker = " <--- [当前目标日]" if d == target_date else ""
-                print(f"      > 日期: {d} | 开盘: {row['Open']:,.2f} | 收盘: {row['Close']:,.2f}{marker}")
-            print(f"      " + "-" * 40)
-            
-            if target_date in df.index:
-                target_row = df.loc[target_date]
-                dates = df.index.tolist()
-                idx = dates.index(target_date)
-                
-                # 寻找基准价判断逻辑
+            # 如果目标日在库里 (完美情况)
+            if target_date in all_dates:
+                rec.hist_t_close = float(df.loc[target_date]['Close'])
+                idx = all_dates.index(target_date)
                 if idx > 0:
-                    prev_close = df.iloc[idx-1]['Close']
-                    print(f"[{name}]   逻辑判断: 成功找到前一交易日 ({dates[idx-1]})，采用其收盘价作为计算基准。")
-                else:
-                    prev_close = target_row['Open']
-                    print(f"[{name}]   ⚠️ 逻辑判断: 数据序列中不存在前一交易日，采用当日开盘价作为计算基准。")
-
-                change_amt = target_row['Close'] - prev_close
-                change_pct = (change_amt / prev_close) * 100
-                
-                hist_data = {
-                    'close': target_row['Close'],
-                    'prev_close': prev_close,
-                    'change_amt': change_amt,
-                    'change_pct': change_pct
-                }
-                
-                print(f"[{name}]   🧮 提取与计算结果 (Engine A):")
-                print(f"      > 前一基准价 (T-1): {prev_close:,.2f}")
-                print(f"      > 目标收盘价 (T):   {hist_data['close']:,.2f}")
-                print(f"      > 绝对涨跌额:      {change_amt:+,.2f}")
-                print(f"      > 相对涨跌幅:      {change_pct:+.4f}%")
+                    rec.hist_t1_date = all_dates[idx-1]
+                    rec.hist_t1_close = float(df.iloc[idx-1]['Close'])
+                print(f"[{name}] 🟢 历史库: 完美拉取 T 日与 T-1 日数据。")
             else:
-                print(f"[{name}] 🟡 Engine A (历史库): 目标日期 {target_date} 不在上述拉取序列中 (可能是休市或遭遇雅虎日结延迟)")
-        else:
-            print(f"[{name}] 🔴 Engine A (历史库): 返回空数据")
+                # 【关键修复】如果目标日缺失(日结延迟)，我们必须把库里最新的那一天作为 T-1，为混合缝合做准备！
+                past_dates = [d for d in all_dates if d < target_date]
+                if past_dates:
+                    rec.hist_t1_date = past_dates[-1]
+                    rec.hist_t1_close = float(df.loc[rec.hist_t1_date]['Close'])
+                print(f"[{name}] 🟡 历史库: T日缺失。但成功截获 T-1 日({rec.hist_t1_date}) 数据作备用。")
     except Exception as e:
-        print(f"[{name}] 🔴 Engine A (历史库) 异常: {e}")
+        print(f"[{name}] 🔴 历史库异常: {e}")
 
-    # ==========================================
-    # Engine B: 实时快照库 (Snapshot / fast_info)
-    # ==========================================
+    # [Engine B: Snapshot]
     try:
         fast = ticker.fast_info
-        info = ticker.info
-        trade_time_utc_ts = info.get('regularMarketTime')
-        
-        if trade_time_utc_ts:
-            trade_dt = datetime.fromtimestamp(trade_time_utc_ts, pytz.utc).astimezone(market_tz)
-            trade_date = trade_dt.date()
-            
-            print(f"\n[{name}] 🔵 Engine B (快照库): 探针发现最新有效交易发生时间:")
-            
-            # --- 打印时区映射对照 ---
-            bjt_tz = pytz.timezone('Asia/Shanghai')
-            utc_dt = trade_dt.astimezone(pytz.utc)
-            bjt_dt = trade_dt.astimezone(bjt_tz)
-            print(f"      📍 当地时间 ({market_info['tz']}): {trade_dt.strftime('%Y-%m-%d %H:%M:%S %Z%z')}")
-            print(f"      🌐 UTC 时间: {' ' * 14}{utc_dt.strftime('%Y-%m-%d %H:%M:%S %Z%z')}")
-            print(f"      🇨🇳 北京时间 (BJT): {' ' * 8}{bjt_dt.strftime('%Y-%m-%d %H:%M:%S %Z%z')}")
-            print(f"      " + "-" * 40)
-            
-            if trade_date == target_date:
-                close_b = fast.last_price
-                prev_close_b = fast.previous_close
-                change_amt_b = close_b - prev_close_b
-                change_pct_b = (change_amt_b / prev_close_b) * 100
-                
-                snap_data = {
-                    'close': close_b,
-                    'prev_close': prev_close_b,
-                    'change_amt': change_amt_b,
-                    'change_pct': change_pct_b
-                }
-                
-                print(f"[{name}]   🧮 提取与计算结果 (Engine B):")
-                print(f"      > 快照底层 Previous Close (T-1): {prev_close_b:,.2f}")
-                print(f"      > 快照底层 Last Price (T):       {close_b:,.2f}")
-                print(f"      > 绝对涨跌额:                   {change_amt_b:+,.2f}")
-                print(f"      > 相对涨跌幅:                   {change_pct_b:+.4f}%")
-                print(f"[{name}] 🟢 Engine B: 时间戳日期({trade_date})比对吻合，快照有效。")
-            elif trade_date < target_date:
-                print(f"[{name}] 🟡 Engine B: 最新快照日期({trade_date}) 早于 目标日期({target_date})，证明目标日确未开盘。")
-            else:
-                print(f"[{name}] 🔴 Engine B: 逻辑异常，快照日期({trade_date}) 晚于 目标日期({target_date})！")
-        else:
-            print(f"[{name}] 🔴 Engine B (快照库): 无法获取交易时间戳，快照失效。")
+        trade_ts = ticker.info.get('regularMarketTime')
+        if trade_ts:
+            trade_dt = datetime.fromtimestamp(trade_ts, pytz.utc).astimezone(market_tz)
+            rec.snap_date = trade_dt.date()
+            rec.snap_last_price = float(fast.last_price)
+            rec.snap_prev_close = float(fast.previous_close)
+            print(f"[{name}] 🔵 快照库: 探针定位于当地时间 {trade_dt.strftime('%m-%d %H:%M:%S')}")
     except Exception as e:
-        print(f"[{name}] 🔴 Engine B (快照库) 异常: {e}")
+        print(f"[{name}] 🔴 快照库异常: {e}")
 
-    # ==========================================
-    # ⚖️ 状态仲裁机 (Arbiter)
-    # ==========================================
-    print(f"\n[{name}] ⚖️ ------------------- 状态仲裁机 -------------------")
-    final_data = None
-    status_code = "" # MATCH, FALLBACK, HOLIDAY, MISMATCH, ERROR
-    
-    if hist_data and snap_data:
-        diff = abs(hist_data['close'] - snap_data['close']) / hist_data['close']
-        if diff < 0.001:
-            print(f"[{name}] 🛡️ 结果: [MATCH] 双库数据一致 (差异极小: {diff*100:.4f}%)。采用历史库数据。")
-            final_data = hist_data
-            status_code = "MATCH"
-        else:
-            print(f"[{name}] 🚨 结果: [MISMATCH] 警告！双库数据不一致！历史={hist_data['close']:.2f}, 快照={snap_data['close']:.2f}")
-            status_code = "MISMATCH"
-            
-    elif not hist_data and snap_data:
-        print(f"[{name}] 🛡️ 结果: [FALLBACK] 历史库无数据，触发降级保护，采用快照库数据！")
-        final_data = snap_data
-        status_code = "FALLBACK"
+    # ---------------------------------------------------------
+    # Stage 2: 衍生计算 (Compute Metrics)
+    # ---------------------------------------------------------
+    # 1. 纯历史涨跌幅
+    if rec.hist_t_close is not None and rec.hist_t1_close is not None:
+        rec.calc_hist_pct = (rec.hist_t_close - rec.hist_t1_close) / rec.hist_t1_close
         
-    elif hist_data and not snap_data:
-        print(f"[{name}] 🛡️ 结果: [HISTORY_ONLY] 快照失效，采用历史库数据。")
-        final_data = hist_data
-        status_code = "MATCH"
+    # 2. 纯快照涨跌幅
+    if rec.snap_last_price is not None and rec.snap_prev_close is not None:
+        rec.calc_snap_pct = (rec.snap_last_price - rec.snap_prev_close) / rec.snap_prev_close
+        
+    # 3. 跨源混合涨跌幅 (你的核心逻辑)
+    if rec.snap_last_price is not None and rec.hist_t1_close is not None:
+        rec.calc_hybrid_pct = (rec.snap_last_price - rec.hist_t1_close) / rec.hist_t1_close
+
+    # 4. 双库差异 (用于触发熔断)
+    if rec.hist_t_close is not None and rec.snap_last_price is not None:
+        rec.diff_hist_vs_snap = abs(rec.hist_t_close - rec.snap_last_price) / rec.hist_t_close
+
+    # 5. 涨跌幅偏差 (你的新增逻辑：历史计算的涨幅 vs 混合计算的涨幅差值)
+    if rec.calc_hist_pct is not None and rec.calc_hybrid_pct is not None:
+        rec.diff_hist_pct_vs_hybrid_pct = rec.calc_hist_pct - rec.calc_hybrid_pct
+
+
+    # ---------------------------------------------------------
+    # Stage 3: 智能仲裁 (Arbitrate - 四道门决策树)
+    # ---------------------------------------------------------
+    
+    # 第一道门：完美的历史数据
+    if rec.hist_t_close is not None:
+        # 如果快照也存在，检查一下是否产生严重分歧
+        if rec.snap_last_price is not None and rec.snap_date == rec.target_date:
+            if rec.diff_hist_vs_snap > 0.001:
+                rec.final_status = "MISMATCH_ERROR"
+            else:
+                rec.final_status = "MATCH_HISTORY"
+                rec.final_close = rec.hist_t_close
+                rec.final_change_pct = rec.calc_hist_pct
+        else:
+            # 快照失效无所谓，历史库完美就行
+            rec.final_status = "MATCH_HISTORY"
+            rec.final_close = rec.hist_t_close
+            rec.final_change_pct = rec.calc_hist_pct
+
+    # 第二道门：触发跨源缝合 (历史无T日，但有T-1日，且快照戳确认是今天)
+    elif rec.hist_t_close is None and rec.hist_t1_close is not None and rec.snap_date == rec.target_date:
+        rec.final_status = "HYBRID_FALLBACK"
+        rec.final_close = rec.snap_last_price
+        rec.final_change_pct = rec.calc_hybrid_pct
+        
+    # 第三道门：极致兜底 (历史库全崩，连昨天数据都没了，只能用纯快照)
+    elif rec.hist_t_close is None and rec.hist_t1_close is None and rec.snap_date == rec.target_date:
+        rec.final_status = "PURE_SNAPSHOT"
+        rec.final_close = rec.snap_last_price
+        rec.final_change_pct = rec.calc_snap_pct
+        
+    # 第四道门：确认休市 (历史无T日，且快照还停留在过去)
+    elif rec.hist_t_close is None and (rec.snap_date is None or rec.snap_date < rec.target_date):
+        rec.final_status = "HOLIDAY"
         
     else:
-        print(f"[{name}] 🛡️ 结果: [HOLIDAY] 双库均判定无新数据，确认为节假日休市。")
-        final_data = None
-        status_code = "HOLIDAY"
+        rec.final_status = "UNKNOWN_ERROR"
 
-    return final_data, status_code
+    # 打印最终宽表日志
+    rec.print_record()
+    return rec
 
-def format_change_text(name, data):
-    status = "收涨" if data['change_amt'] > 0 else "收跌" if data['change_amt'] < 0 else "收平"
-    return f"{name}{status}{abs(data['change_pct']):.2f}%"
+# --- 辅助与发送函数保持不变 ---
+def format_change_text(name, change_amt, change_pct):
+    status = "收涨" if change_amt > 0 else "收跌" if change_amt < 0 else "收平"
+    return f"{name}{status}{abs(change_pct)*100:.2f}%"
 
 def main():
     target_date = get_us_eastern_target_date()
     date_str_cn = f"{target_date.year}年{target_date.month}月{target_date.day}日"
     
-    print(f"\n🚀 开始执行自动化报表任务，锁定交易锚点: {target_date} (美东)")
+    print(f"\n🚀 === 自动化日报生成流水线启动 | 美东锚点: {target_date} ===")
     
     report_data = [] 
     global_mismatch_flag = False 
@@ -221,17 +228,19 @@ def main():
     us_phrases = []
     us_closed_count = 0
     for m in MARKETS['US']:
-        data, status = get_market_data_dual_engine(m, target_date)
+        rec = process_market(m, target_date)
         
-        if status == "MISMATCH":
+        if rec.final_status == "MISMATCH_ERROR":
             global_mismatch_flag = True
             
-        if data:
-            text = format_change_text(m['full_name'], data)
+        if rec.final_status in ["MATCH_HISTORY", "HYBRID_FALLBACK", "PURE_SNAPSHOT"]:
+            # 为了表格着色和文字，简单计算出绝对变化额
+            change_amt = rec.final_close - (rec.final_close / (1 + rec.final_change_pct))
+            text = format_change_text(m['full_name'], change_amt, rec.final_change_pct)
             us_phrases.append(text)
-            color = "#ff0000" if data['change_amt'] > 0 else "#008000"
-            report_data.append([m['full_name'], f"{data['close']:,.2f}", f"{data['change_amt']:+.2f}", f"{data['change_pct']:+.2f}%", color])
-        else:
+            color = "#ff0000" if change_amt > 0 else "#008000"
+            report_data.append([m['full_name'], f"{rec.final_close:,.2f}", f"{change_amt:+.2f}", f"{rec.final_change_pct*100:+.2f}%", color])
+        elif rec.final_status == "HOLIDAY":
             us_closed_count += 1
             report_data.append([m['full_name'], "-", "-", "因节假日休市", "gray"])
 
@@ -241,17 +250,18 @@ def main():
     eu_phrases = []
     eu_closed_count = 0
     for m in MARKETS['EU']:
-        data, status = get_market_data_dual_engine(m, target_date)
+        rec = process_market(m, target_date)
         
-        if status == "MISMATCH":
+        if rec.final_status == "MISMATCH_ERROR":
             global_mismatch_flag = True
             
-        if data:
-            text = format_change_text(m['full_name'], data)
+        if rec.final_status in ["MATCH_HISTORY", "HYBRID_FALLBACK", "PURE_SNAPSHOT"]:
+            change_amt = rec.final_close - (rec.final_close / (1 + rec.final_change_pct))
+            text = format_change_text(m['full_name'], change_amt, rec.final_change_pct)
             eu_phrases.append(text)
-            color = "#ff0000" if data['change_amt'] > 0 else "#008000"
-            report_data.append([m['full_name'], f"{data['close']:,.2f}", f"{data['change_amt']:+.2f}", f"{data['change_pct']:+.2f}%", color])
-        else:
+            color = "#ff0000" if change_amt > 0 else "#008000"
+            report_data.append([m['full_name'], f"{rec.final_close:,.2f}", f"{change_amt:+.2f}", f"{rec.final_change_pct*100:+.2f}%", color])
+        elif rec.final_status == "HOLIDAY":
             eu_closed_count += 1
             eu_phrases.append(f"{m['country']}因节假日休市")
             report_data.append([m['full_name'], "-", "-", "因节假日休市", "gray"])
@@ -261,9 +271,7 @@ def main():
     # --- 3. 熔断与全局拦截 ---
     if global_mismatch_flag:
         print("\n" + "❌"*20)
-        print("🚨 触发全局熔断机制！检测到历史库与快照库数据存在严重不一致。")
-        print("为防止向订阅者发送可能存在计算错误的假数据，已主动拦截本次邮件发送流程！")
-        print("建议排查原因后手动运行或等待下一个工作日自愈。")
+        print("🚨 触发全局熔断！双引擎数据发生严重分歧，已主动阻断发信防止假数据外泄。")
         print("❌"*20 + "\n")
         sys.exit(1)
 
@@ -275,7 +283,7 @@ def main():
     final_text = f"境外股市运行情况。当地时间{date_str_cn}，{us_summary}。{eu_summary}。"
     
     print("\n" + "="*40)
-    print("📝 最终生成的文字摘要 (校验通过，准备发送)：")
+    print("📝 最终报表摘要 (准备发信)：")
     print(final_text)
     print("="*40 + "\n")
 
@@ -288,39 +296,29 @@ def send_email_html(subject, summary, table_rows, date_str):
     smtp_server = os.environ.get('MAIL_SERVER', '').strip()
     
     if not sender or not password:
-        print("⚠️ 邮件发送跳过：未检测到发信环境变量 (本地测试模式)。")
+        print("⚠️ 发信环节跳过：未检测到 MAIL_USERNAME 或 MAIL_PASSWORD (纯本地测试模式)。")
         return
 
     receivers_str = os.environ.get('MAIL_RECEIVER', '')
     receivers = [r.strip() for r in receivers_str.split(',') if r.strip()]
-    
-    try:
-        smtp_port = int(os.environ.get('MAIL_PORT', 587))
-    except:
-        smtp_port = 587
+    smtp_port = int(os.environ.get('MAIL_PORT', 587))
 
-    email_body = f"""
-    <div style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; color: #333; line-height: 1.8; font-size: 16px;">
-        <p>{summary}</p>
-    </div>
-    """
-
+    email_body = f"<div style=\"font-family: Arial, sans-serif; color: #333; line-height: 1.8;\"><p>{summary}</p></div>"
     msg = MIMEText(email_body, 'html', 'utf-8')
     msg['From'] = formataddr(("境外股市情况", sender))
     msg['To'] = ",".join(receivers)
     msg['Subject'] = Header(subject, 'utf-8')
 
     try:
-        print(f"📧 准备连接 {smtp_server}:{smtp_port} ...")
+        print(f"📧 连接 {smtp_server}:{smtp_port} 并发送至 {len(receivers)} 个订阅者...")
         server = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
         server.starttls()
         server.login(sender, password)
-        print(f"📧 正在发送给 {len(receivers)} 位收件人...")
         server.sendmail(sender, receivers, msg.as_string())
         server.quit()
         print("✅ 邮件群发成功！")
     except Exception as e:
-        print(f"❌ 发送失败: {e}")
+        print(f"❌ 发信失败: {e}")
 
 if __name__ == "__main__":
     main()
