@@ -7,7 +7,6 @@ from datetime import datetime, timedelta
 import pytz
 import os
 import time
-import requests # 新增：用于自定义网络会话
 
 # --- 1. 基础配置 ---
 MARKETS = {
@@ -38,16 +37,12 @@ def get_target_date():
     return datetime.now(us_eastern).date()
 
 def get_market_data(symbol, target_date):
-    """获取指定日期的指数数据（带自定义超时与 Plan B 抢救机制）"""
+    """获取指定日期的指数数据（依赖 yfinance 内置防封锁 + Plan B 抢救机制）"""
     
-    # 建立一个自定义的请求会话，伪装成浏览器，并设置防卡死
-    session = requests.Session()
-    session.headers['User-agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-
     for attempt in range(3):
         try:
-            # 传入自定义 session，利用 requests 底层机制防止被 GitHub 强杀
-            ticker = yf.Ticker(symbol, session=session)
+            # 核心修复：移除自定义 session，让 yfinance 使用内置的 curl_cffi 高级伪装
+            ticker = yf.Ticker(symbol)
             
             start_date = target_date - timedelta(days=5)
             end_date = target_date + timedelta(days=3)
@@ -111,7 +106,7 @@ def get_market_data(symbol, target_date):
             }
 
         except Exception as e:
-            # 捕获包括超时在内的所有异常，休眠后重试
+            # 捕获异常，休眠后重试
             print(f"❌ [{attempt+1}/3] 获取 {symbol} 发生异常: {e}")
             time.sleep(2) 
 
