@@ -2,7 +2,7 @@ name: Keep Alive
 
 on:
   schedule:
-    # 每月 1 号凌晨 0   点运行 (彻底避开你跑股票数据的时间)
+    # 每月 1 号凌晨 0 点运行 (彻底避开你跑股票数据的时间)
     - cron: '0 3 1 * *'
   # 保留手动触发按钮，方便随时测试
   workflow_dispatch:
