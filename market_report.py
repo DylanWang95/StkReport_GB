@@ -1,4 +1,5 @@
 import yfinance as yf
+import math
 import smtplib
 from email.mime.text import MIMEText
 from email.header import Header
@@ -23,6 +24,10 @@ MARKETS = {
         {'symbol': '^GDAXI', 'name': '德国DAX',  'full_name': '德国DAX指数', 'country': '德国', 'tz': 'Europe/Berlin'}
     ]
 }
+
+# 【新增】历史库昨收价和快照库昨收价允许的最大偏差。
+# 超过 0.1% 时，说明 Yahoo history 可能漏掉了一个交易日，改用快照昨收计算涨跌幅。
+PREV_CLOSE_DRIFT_THRESHOLD = 0.001
 
 # --- 2. 核心数据架构 (17字段宽表) ---
 @dataclass
@@ -90,6 +95,14 @@ def get_us_eastern_target_date():
 
     return target_date
 
+def safe_float(value):
+    """【新增】把 Yahoo 返回的 NaN/空值过滤掉，避免 nan 被当作有效收盘价参与计算。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
 def process_market(market_info, target_date):
     """三段式流控：采掘 (Fetch) -> 衍生计算 (Compute) -> 仲裁 (Arbitrate)"""
     symbol = market_info['symbol']
@@ -113,19 +126,20 @@ def process_market(market_info, target_date):
         if not df.empty:
             df.index = [d.date() for d in df.index]
             all_dates = df.index.tolist()
+            print(f"[{name}] 🧭 历史库日期序列: {all_dates}")  # 【新增】排查 Yahoo history 是否漏日
             
             if target_date in all_dates:
-                rec.hist_t_close = float(df.loc[target_date]['Close'])
+                rec.hist_t_close = safe_float(df.loc[target_date]['Close'])
                 idx = all_dates.index(target_date)
                 if idx > 0:
                     rec.hist_t1_date = all_dates[idx-1]
-                    rec.hist_t1_close = float(df.iloc[idx-1]['Close'])
+                    rec.hist_t1_close = safe_float(df.iloc[idx-1]['Close'])
                 print(f"[{name}] 🟢 历史库: 完美拉取 T 日与 T-1 日数据。")
             else:
                 past_dates = [d for d in all_dates if d < target_date]
                 if past_dates:
                     rec.hist_t1_date = past_dates[-1]
-                    rec.hist_t1_close = float(df.loc[rec.hist_t1_date]['Close'])
+                    rec.hist_t1_close = safe_float(df.loc[rec.hist_t1_date]['Close'])
                 print(f"[{name}] 🟡 历史库: T日缺失。但成功截获 T-1 日({rec.hist_t1_date}) 数据作备用。")
     except Exception as e:
         print(f"[{name}] 🔴 历史库异常: {e}")
@@ -137,8 +151,8 @@ def process_market(market_info, target_date):
         if trade_ts:
             trade_dt = datetime.fromtimestamp(trade_ts, pytz.utc).astimezone(market_tz)
             rec.snap_date = trade_dt.date()
-            rec.snap_last_price = float(fast.last_price)
-            rec.snap_prev_close = float(fast.previous_close)
+            rec.snap_last_price = safe_float(fast.last_price)
+            rec.snap_prev_close = safe_float(fast.previous_close)
             print(f"[{name}] 🔵 快照库: 探针定位于当地时间 {trade_dt.strftime('%m-%d %H:%M:%S')}")
     except Exception as e:
         print(f"[{name}] 🔴 快照库异常: {e}")
@@ -178,9 +192,20 @@ def process_market(market_info, target_date):
     
     # 第一道门：完美的历史数据
     if rec.hist_t_close is not None:
-        if rec.snap_last_price is not None and rec.snap_date == rec.target_date:
-            if rec.diff_hist_vs_snap > 0.001:
+        if rec.snap_date == rec.target_date:
+            if rec.snap_last_price is not None and rec.diff_hist_vs_snap > 0.001:
                 rec.final_status = "MISMATCH_ERROR"
+            # 【新增】如果今日收盘价匹配，但历史库昨收价明显偏离快照昨收价，
+            # 通常说明 history 漏掉了 T-1 交易日。此时使用“历史 T 日收盘 + 快照昨收”计算涨跌幅。
+            elif (
+                rec.snap_prev_close is not None
+                and rec.diff_hist_prev_vs_snap_prev is not None
+                and rec.diff_hist_prev_vs_snap_prev > PREV_CLOSE_DRIFT_THRESHOLD
+            ):
+                print(f"[{name}] 🟠 昨收修正: 历史昨收({rec.hist_t1_date})={rec.hist_t1_close} 与快照昨收={rec.snap_prev_close} 差异超过阈值，改用快照昨收计算涨跌幅。")
+                rec.final_status = "HYBRID_PREV_CLOSE"
+                rec.final_close = rec.hist_t_close
+                rec.final_change_pct = (rec.hist_t_close - rec.snap_prev_close) / rec.snap_prev_close
             else:
                 rec.final_status = "MATCH_HISTORY"
                 rec.final_close = rec.hist_t_close
@@ -235,7 +260,7 @@ def main():
         if rec.final_status == "MISMATCH_ERROR":
             global_mismatch_flag = True
             
-        if rec.final_status in ["MATCH_HISTORY", "HYBRID_FALLBACK", "PURE_SNAPSHOT"]:
+        if rec.final_status in ["MATCH_HISTORY", "HYBRID_PREV_CLOSE", "HYBRID_FALLBACK", "PURE_SNAPSHOT"]:
             change_amt = rec.final_close - (rec.final_close / (1 + rec.final_change_pct))
             text = format_change_text(m['full_name'], change_amt, rec.final_change_pct)
             us_phrases.append(text)
@@ -256,7 +281,7 @@ def main():
         if rec.final_status == "MISMATCH_ERROR":
             global_mismatch_flag = True
             
-        if rec.final_status in ["MATCH_HISTORY", "HYBRID_FALLBACK", "PURE_SNAPSHOT"]:
+        if rec.final_status in ["MATCH_HISTORY", "HYBRID_PREV_CLOSE", "HYBRID_FALLBACK", "PURE_SNAPSHOT"]:
             change_amt = rec.final_close - (rec.final_close / (1 + rec.final_change_pct))
             text = format_change_text(m['full_name'], change_amt, rec.final_change_pct)
             eu_phrases.append(text)
