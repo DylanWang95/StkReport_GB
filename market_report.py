@@ -73,9 +73,10 @@ class MarketRecord:
         hp = f"{self.calc_hist_pct*100:+.4f}%" if self.calc_hist_pct is not None else "None"
         hyp = f"{self.calc_hybrid_pct*100:+.4f}%" if self.calc_hybrid_pct is not None else "None"
         diff_p = f"{self.diff_hist_pct_vs_hybrid_pct*100:+.4f}%" if self.diff_hist_pct_vs_hybrid_pct is not None else "None"
+        final_p = f"{self.final_change_pct*100:+.4f}%" if self.final_change_pct is not None else "None"
         
         print(f"  [Calc] 纯历史涨幅: {hp} | 跨源混合涨幅: {hyp} | 涨幅差值(历史-混合): {diff_p}")
-        print(f"  [Output] 🏁 仲裁状态: {self.final_status}")
+        print(f"  [Output] 🏁 仲裁状态: {self.final_status} | 最终实际采用涨幅: {final_p}")
         print("-" * 65)
 
 def get_us_eastern_target_date():
