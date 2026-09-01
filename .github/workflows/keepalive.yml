@@ -2,12 +2,11 @@ name: Keep Alive
 
 on:
   schedule:
-    # 每月 1 号凌晨 0 点运行 (彻底避开你跑股票数据的时间)
-    - cron: '0 3 1 * *'
-  # 保留手动触发按钮，方便随时测试
+    # UTC 03:17，即北京时间每月 1 日 11:17；与每日美股报告错开。
+    - cron: '17 3 1 * *'
   workflow_dispatch:
 
-# ⚠️ 关键设置：赋予机器人写入代码库的权限，否则它无法打卡
+# 允许工作流向默认分支提交一条月度打卡记录。
 permissions:
   contents: write
 
@@ -15,8 +14,15 @@ jobs:
   keep-alive:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-      - name: Run Keep Alive Action
-        uses: gautamkrishnar/keepalive-workflow@v1
+      - name: Create keep-alive commit
+        shell: bash
+        run: |
+          date -u '+%Y-%m-%dT%H:%M:%SZ' > .github/keepalive
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/keepalive
+          git commit -m "chore: keep workflows active"
+          git push
