@@ -4,12 +4,17 @@ import smtplib
 from email.mime.text import MIMEText
 from email.header import Header
 from email.utils import formataddr
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 import pytz
 import os
 import sys
 from dataclasses import dataclass
 from typing import Optional
+from history_store import CloseStore
+
+STORE_PATH = os.environ.get('CLOSE_STORE_PATH', 'data/historical_closes.csv')
+MARKET_CLOSE = {'^DJI': time(16, 0), '^GSPC': time(16, 0), '^IXIC': time(16, 0),
+                '^FTSE': time(16, 30), '^FCHI': time(17, 30), '^GDAXI': time(17, 30)}
 
 # --- 1. 基础配置 ---
 MARKETS = {
@@ -44,10 +49,14 @@ class MarketRecord:
     
     # 3. Engine B: 快照事实层
     snap_date: Optional[datetime.date] = None
+    snap_datetime: Optional[datetime] = None
     snap_last_price: Optional[float] = None
     snap_prev_close: Optional[float] = None  # regularMarketPreviousClose，或其常规日线备用值
     hourly_prev_date: Optional[datetime.date] = None
     hourly_prev_close: Optional[float] = None
+    stored_prev_date: Optional[datetime.date] = None
+    stored_prev_close: Optional[float] = None
+    stored_prev_source: Optional[str] = None
     
     # 4. 衍生计算层
     calc_hist_pct: Optional[float] = None
@@ -74,6 +83,7 @@ class MarketRecord:
         diff_quote_hourly_p = f"{self.diff_snap_prev_vs_hourly_prev*100:.4f}%" if self.diff_snap_prev_vs_hourly_prev is not None else "None"
         print(f"  [Snap] 真实戳: {self.snap_date} | 最新: {self.snap_last_price} | 常规昨收: {self.snap_prev_close} | 与历史昨收差异: {diff_prev_p}")
         print(f"  [Hour] 常规小时上一交易日: {self.hourly_prev_date} | 收盘: {self.hourly_prev_close} | 与常规昨收差异: {diff_quote_hourly_p}")
+        print(f"  [Store] 已留存上一交易日: {self.stored_prev_date} | 收盘: {self.stored_prev_close} | 来源: {self.stored_prev_source}")
         
         # 格式化百分比显示
         hp = f"{self.calc_hist_pct*100:+.4f}%" if self.calc_hist_pct is not None else "None"
@@ -137,7 +147,7 @@ def get_hourly_previous_session(ticker, target_date, market_tz):
         print(f"🟣 常规小时数据异常: {e}")
         return None, None
 
-def process_market(market_info, target_date):
+def process_market(market_info, target_date, close_store=None):
     """三段式流控：采掘 (Fetch) -> 衍生计算 (Compute) -> 仲裁 (Arbitrate)"""
     symbol = market_info['symbol']
     name = market_info['name']
@@ -148,6 +158,12 @@ def process_market(market_info, target_date):
     print("="*50)
     
     rec = MarketRecord(index_name=name, target_date=target_date)
+    if close_store is not None:
+        prior = close_store.previous(symbol, target_date)
+        if prior:
+            rec.stored_prev_date = prior['date']
+            rec.stored_prev_close = prior['close']
+            rec.stored_prev_source = prior['source']
     ticker = yf.Ticker(symbol)
     
     # ---------------------------------------------------------
@@ -186,7 +202,11 @@ def process_market(market_info, target_date):
         if trade_ts:
             trade_dt = datetime.fromtimestamp(trade_ts, pytz.utc).astimezone(market_tz)
             rec.snap_date = trade_dt.date()
-            rec.snap_last_price = safe_float(fast.last_price)
+            rec.snap_datetime = trade_dt
+            # 报价日期只属于同一份 info 中的常规交易价，不可直接赋给 fast_info 日线价格。
+            rec.snap_last_price = safe_float(info.get('regularMarketPrice'))
+            if rec.snap_last_price is None and rec.hist_t_close is not None:
+                rec.snap_last_price = safe_float(fast.last_price)
             # 【调整】优先读取 Yahoo 报价中的常规交易昨收，不再使用包含盘前盘后的 fast.previous_close。
             rec.snap_prev_close = safe_float(info.get('regularMarketPreviousClose'))
             if rec.snap_prev_close is None:
@@ -299,15 +319,35 @@ def process_market(market_info, target_date):
 
     # 第二道门：触发跨源缝合
     elif rec.hist_t_close is None and rec.hist_t1_close is not None and rec.snap_date == rec.target_date:
-        rec.final_status = "HYBRID_FALLBACK"
-        rec.final_close = rec.snap_last_price
-        rec.final_change_pct = rec.calc_hybrid_pct
+        if rec.snap_last_price is None or rec.hourly_prev_date is None:
+            rec.final_status = "PREV_CLOSE_UNVERIFIED"
+        elif rec.hourly_prev_date == rec.hist_t1_date:
+            rec.final_status = "HYBRID_FALLBACK"
+            rec.final_close = rec.snap_last_price
+            rec.final_change_pct = rec.calc_hybrid_pct
+        elif (rec.hist_t1_date < rec.hourly_prev_date < rec.target_date
+              and rec.snap_prev_close is not None
+              and rec.snap_prev_close > 0
+              and rec.diff_snap_prev_vs_hourly_prev is not None
+              and rec.diff_snap_prev_vs_hourly_prev <= PREV_CLOSE_CONFIRM_THRESHOLD):
+            rec.final_status = "HYBRID_FALLBACK_PREV_CLOSE"
+            rec.final_close = rec.snap_last_price
+            rec.final_change_pct = rec.calc_snap_pct
+            print(f"[{name}] T日与真实T-1日均缺失，采用T日快照与已校验的常规昨收。")
+        else:
+            rec.final_status = "PREV_CLOSE_UNVERIFIED"
         
     # 第三道门：极致兜底
     elif rec.hist_t_close is None and rec.hist_t1_close is None and rec.snap_date == rec.target_date:
-        rec.final_status = "PURE_SNAPSHOT"
-        rec.final_close = rec.snap_last_price
-        rec.final_change_pct = rec.calc_snap_pct
+        if (rec.hourly_prev_date is not None and rec.hourly_prev_date < target_date
+                and rec.diff_snap_prev_vs_hourly_prev is not None
+                and rec.diff_snap_prev_vs_hourly_prev <= PREV_CLOSE_CONFIRM_THRESHOLD
+                and rec.calc_snap_pct is not None):
+            rec.final_status = "PURE_SNAPSHOT"
+            rec.final_close = rec.snap_last_price
+            rec.final_change_pct = rec.calc_snap_pct
+        else:
+            rec.final_status = "PREV_CLOSE_UNVERIFIED"
         
     # 第四道门：确认休市
     elif rec.hist_t_close is None and (rec.snap_date is None or rec.snap_date < rec.target_date):
@@ -316,15 +356,60 @@ def process_market(market_info, target_date):
     else:
         rec.final_status = "UNKNOWN_ERROR"
 
+    # 已留存的、带真实交易日期的收盘，优先解决 Yahoo T-1 日线漏行。
+    if rec.stored_prev_date is not None:
+        if (rec.stored_prev_source == 'yahoo_quote' and
+            rec.hist_t1_date == rec.stored_prev_date and
+            rec.hist_t1_close is not None and
+            abs(rec.hist_t1_close / rec.stored_prev_close - 1) > PREV_CLOSE_CONFIRM_THRESHOLD):
+            print(f"[{name}] 昨日快照留存与后来日线冲突，阻断报告并等待核验。")
+            rec.final_status = 'PREV_CLOSE_UNVERIFIED'
+            rec.final_close = rec.final_change_pct = None
+        elif (target_date - rec.stored_prev_date).days > 4:
+            print(f"[{name}] 底库可能过期：上一条为 {rec.stored_prev_date}，目标为 {target_date}")
+            rec.final_status = 'PREV_CLOSE_UNVERIFIED'
+            rec.final_close = rec.final_change_pct = None
+        elif rec.hourly_prev_date is not None and rec.hourly_prev_date > rec.stored_prev_date:
+            print(f"[{name}] 底库落后于小时交易日：{rec.stored_prev_date} < {rec.hourly_prev_date}")
+            rec.final_status = 'PREV_CLOSE_UNVERIFIED'
+            rec.final_close = rec.final_change_pct = None
+        elif (rec.hist_t_close is not None and rec.snap_date == target_date
+              and rec.snap_last_price is not None
+              and rec.diff_hist_vs_snap > T_CLOSE_MISMATCH_THRESHOLD):
+            rec.final_status = 'MISMATCH_ERROR'
+            rec.final_close = rec.final_change_pct = None
+        else:
+            t_close = rec.hist_t_close
+            status = 'MATCH_STORED_PREV'
+            if t_close is None and rec.snap_date == target_date and rec.snap_datetime is not None:
+                if rec.snap_datetime.time().replace(tzinfo=None) >= MARKET_CLOSE[symbol]:
+                    t_close = rec.snap_last_price
+                    status = 'SNAPSHOT_STORED_PREV'
+            if t_close is not None and rec.stored_prev_close > 0:
+                rec.final_status = status
+                rec.final_close = t_close
+                rec.final_change_pct = t_close / rec.stored_prev_close - 1
+                if (rec.snap_prev_close is not None and
+                    abs(rec.snap_prev_close / rec.stored_prev_close - 1) > PREV_CLOSE_WARN_THRESHOLD):
+                    print(f"[{name}] ⚠️ Yahoo昨收与留存昨收不一致；使用留存日期 {rec.stored_prev_date}。")
+            elif rec.snap_date == target_date:
+                rec.final_status = 'PREV_CLOSE_UNVERIFIED'
+                rec.final_close = rec.final_change_pct = None
+
     rec.print_record()
     return rec
 
 # --- 辅助与发送函数 ---
 def format_change_text(name, change_amt, change_pct):
-    status = "收涨" if change_amt > 0 else "收跌" if change_amt < 0 else "收平"
-    return f"{name}{status}{abs(change_pct)*100:.2f}%"
+    displayed = f"{abs(change_pct)*100:.2f}"
+    if displayed == "0.00":
+        return f"{name}收平"
+    status = "收涨" if change_pct > 0 else "收跌"
+    return f"{name}{status}{displayed}%"
 
 def main():
+    if os.environ.get('NO_SEND_REASON'):
+        print(f"📭 本次仅打印、不发信：{os.environ['NO_SEND_REASON']}")
     target_date = get_us_eastern_target_date()
     date_str_cn = f"{target_date.year}年{target_date.month}月{target_date.day}日"
     
@@ -332,17 +417,20 @@ def main():
     
     report_data = [] 
     global_blocking_flag = False
+    close_store = CloseStore(STORE_PATH)
+    records = []
     
     # --- 1. 处理美股 ---
     us_phrases = []
     us_closed_count = 0
     for m in MARKETS['US']:
-        rec = process_market(m, target_date)
+        rec = process_market(m, target_date, close_store)
+        records.append((m, rec))
         
         if rec.final_status in ["MISMATCH_ERROR", "PREV_CLOSE_UNVERIFIED", "UNKNOWN_ERROR"]:
             global_blocking_flag = True
             
-        if rec.final_status in ["MATCH_HISTORY", "MATCH_HISTORY_PREV_CONFLICT", "HYBRID_PREV_CLOSE", "HYBRID_FALLBACK", "PURE_SNAPSHOT"]:
+        if rec.final_status in ["MATCH_STORED_PREV", "SNAPSHOT_STORED_PREV", "MATCH_HISTORY", "MATCH_HISTORY_PREV_CONFLICT", "HYBRID_PREV_CLOSE", "HYBRID_FALLBACK", "HYBRID_FALLBACK_PREV_CLOSE", "PURE_SNAPSHOT"]:
             change_amt = rec.final_close - (rec.final_close / (1 + rec.final_change_pct))
             text = format_change_text(m['full_name'], change_amt, rec.final_change_pct)
             us_phrases.append(text)
@@ -358,12 +446,13 @@ def main():
     eu_phrases = []
     eu_closed_count = 0
     for m in MARKETS['EU']:
-        rec = process_market(m, target_date)
+        rec = process_market(m, target_date, close_store)
+        records.append((m, rec))
         
         if rec.final_status in ["MISMATCH_ERROR", "PREV_CLOSE_UNVERIFIED", "UNKNOWN_ERROR"]:
             global_blocking_flag = True
             
-        if rec.final_status in ["MATCH_HISTORY", "MATCH_HISTORY_PREV_CONFLICT", "HYBRID_PREV_CLOSE", "HYBRID_FALLBACK", "PURE_SNAPSHOT"]:
+        if rec.final_status in ["MATCH_STORED_PREV", "SNAPSHOT_STORED_PREV", "MATCH_HISTORY", "MATCH_HISTORY_PREV_CONFLICT", "HYBRID_PREV_CLOSE", "HYBRID_FALLBACK", "HYBRID_FALLBACK_PREV_CLOSE", "PURE_SNAPSHOT"]:
             change_amt = rec.final_close - (rec.final_close / (1 + rec.final_change_pct))
             text = format_change_text(m['full_name'], change_amt, rec.final_change_pct)
             eu_phrases.append(text)
@@ -382,6 +471,16 @@ def main():
         print("🚨 触发全局熔断！存在 T 日价格冲突或上一交易日无法确认，已主动阻断发信防止错误数据外发。")
         print("❌"*20 + "\n")
         sys.exit(1)
+
+    for market, rec in records:
+        if rec.final_status not in ('MATCH_STORED_PREV', 'SNAPSHOT_STORED_PREV'):
+            continue
+        if rec.hist_t_close is not None:
+            close_store.add_if_missing(market['symbol'], target_date, rec.hist_t_close, 'yahoo_daily')
+        elif (rec.final_status == 'SNAPSHOT_STORED_PREV' and rec.snap_datetime is not None
+              and rec.snap_datetime.time().replace(tzinfo=None) >= MARKET_CLOSE[market['symbol']]):
+            close_store.add_if_missing(market['symbol'], target_date, rec.snap_last_price, 'yahoo_quote')
+    close_store.save()
 
     if us_closed_count + eu_closed_count == len(MARKETS['US']) + len(MARKETS['EU']):
         print(f"\n💤 结论: {target_date} 全球主要市场均因节假日休市，跳过邮件发送流程。")
@@ -435,9 +534,18 @@ def send_email_html(subject, summary, table_rows, date_str):
         server = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
         server.starttls()
         server.login(sender, password)
-        server.sendmail(sender, receivers, msg.as_string())
-        server.quit()
-        print("✅ 邮件群发成功！")
+        refused = server.sendmail(sender, receivers, msg.as_string())
+        # SMTP 接受任何收件人即记录，避免部分发送失败后重跑造成重复邮件。
+        if len(refused) < len(receivers) and os.environ.get('GITHUB_OUTPUT'):
+            with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+                output.write('mail_sent=true\n')
+        try:
+            server.quit()
+        except Exception as cleanup_error:
+            print(f"⚠️ SMTP已接受邮件，关闭连接失败：{cleanup_error}")
+        if refused:
+            raise RuntimeError(f"部分发送失败：{len(refused)} 位收件人被SMTP拒绝。")
+        print("✅ 邮件群发成功（SMTP已接受）！")
     except Exception as e:
         print(f"❌ 发信失败: {e}")
         raise
