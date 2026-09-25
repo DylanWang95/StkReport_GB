@@ -6,95 +6,90 @@ on:
     # 北京时间：夏令时次日 04:35，冬令时次日 05:35
     - cron: '35 16 * * 1-5'
       timezone: 'America/New_York'
-
-  # 2. 手动触发按钮 (无输入框版)
-  # 点击后直接运行，不再弹窗询问日期
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   actions: read
 
+# 检查与发送一起串行执行，避免两次运行同时通过检查。
+concurrency:
+  group: stk-report-mail
+  cancel-in-progress: false
+
 jobs:
-  check_manual_run:
+  run_report:
     runs-on: ubuntu-latest
-    outputs:
-      should_run: ${{ steps.check.outputs.should_run }}
     steps:
-      - name: Check successful manual run today
-        id: check
+      - name: Check daily delivery
+        id: guard
         uses: actions/github-script@v9
         with:
           retries: 3
           script: |
-            if (context.eventName !== 'schedule') {
-              core.info('当前为手动触发，正常执行报表。');
-              core.setOutput('should_run', 'true');
-              return;
-            }
-
-            try {
-              const dateParts = Object.fromEntries(
-                new Intl.DateTimeFormat('en-US', {
-                  timeZone: 'Asia/Shanghai',
-                  year: 'numeric',
-                  month: '2-digit',
-                  day: '2-digit'
-                }).formatToParts(new Date()).map(({ type, value }) => [type, value])
-              );
-
-              const beijingDate = `${dateParts.year}-${dateParts.month}-${dateParts.day}`;
-              const startTime = new Date(`${beijingDate}T00:00:00+08:00`).toISOString();
-
-              const { data } = await github.rest.actions.listWorkflowRuns({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                workflow_id: 'main.yml',
-                branch: process.env.GITHUB_REF_NAME,
-                event: 'workflow_dispatch',
-                status: 'success',
-                created: `>=${startTime}`,
-                per_page: 100
+            const day = new Intl.DateTimeFormat('en-CA', {
+              timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit'
+            }).format(new Date());
+            const start = new Date(`${day}T00:00:00+08:00`).toISOString();
+            const end = new Date(new Date(start).getTime() + 86400000).toISOString();
+            // 不按success筛选：邮件可能已经发送，但后续步骤失败。
+            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              owner: context.repo.owner, repo: context.repo.repo,
+              workflow_id: 'main.yml', created: `${start}..${end}`, per_page: 100
+            });
+            let prior;
+            for (const run of runs) {
+              if (!['schedule', 'workflow_dispatch'].includes(run.event)) continue;
+              const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+                owner: context.repo.owner, repo: context.repo.repo,
+                run_id: run.id, filter: 'all', per_page: 100
               });
-
-              const manualRun = data.workflow_runs[0];
-              if (manualRun) {
-                core.info(`北京时间 ${beijingDate} 已有成功的手动运行 #${manualRun.run_number}：${manualRun.html_url}`);
-                core.info('跳过本次定时报表，避免重复发送。');
-                core.setOutput('should_run', 'false');
-              } else {
-                core.info(`北京时间 ${beijingDate} 未发现成功的手动运行，继续执行定时报表。`);
-                core.setOutput('should_run', 'true');
-              }
-            } catch (error) {
-              core.warning(`检查手动运行记录失败：${error.message}`);
-              core.warning('为避免漏发日报，本次定时报表继续执行。');
-              core.setOutput('should_run', 'true');
+              const sent = jobs.some(job => (job.steps || []).some(step =>
+                step.name === 'Record SMTP accepted' && step.conclusion === 'success'));
+              // 首次迁移兼容旧workflow：旧版绿色运行作为保守防重证据。
+              const legacy = run.id !== context.runId && run.conclusion === 'success'
+                && !jobs.some(job => (job.steps || []).some(step => step.name === 'Check daily delivery'))
+                && jobs.some(job => (job.steps || []).some(step =>
+                  step.name === 'Run Report Script' && step.conclusion === 'success'));
+              if (sent || legacy) { prior = run; break; }
             }
+            const reason = prior
+              ? `北京时间 ${day} 已有发送记录/旧版成功运行 #${prior.run_number}：${prior.html_url}；本次仅计算并打印。`
+              : '';
+            core.info(reason || `北京时间 ${day} 尚无发送记录，允许发送。`);
+            core.setOutput('send_email', prior ? 'false' : 'true');
+            core.setOutput('reason', reason);
+            // 查询失败直接使步骤失败，不能在未知状态下放行发信。
 
-  run_report:
-    needs: check_manual_run
-    if: needs.check_manual_run.outputs.should_run == 'true'
-    runs-on: ubuntu-latest
-    steps:
       - name: Checkout code
         uses: actions/checkout@v3
-
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
       - name: Run Report Script
+        id: report
         env:
+          SEND_EMAIL: ${{ steps.guard.outputs.send_email }}
+          NO_SEND_REASON: ${{ steps.guard.outputs.reason }}
           MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
           MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
           MAIL_RECEIVER: ${{ secrets.MAIL_RECEIVER }}
           MAIL_SERVER: ${{ secrets.MAIL_SERVER }}
           MAIL_PORT: ${{ secrets.MAIL_PORT }}
-          # 注意：这里删除了 INPUT_TEST_DATE 变量
-          # Python 脚本读取不到这个变量时，会自动进入“自动获取当天数据”模式
         run: python market_report.py
+      - name: Save validated closes
+        if: ${{ success() }}
+        run: |
+          git add data/historical_closes.csv
+          if ! git diff --cached --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "Update confirmed index closes"
+            git push
+          fi
+      - name: Record SMTP accepted
+        if: ${{ always() && steps.report.outputs.mail_sent == 'true' }}
+        run: echo "SMTP accepted this delivery; subsequent runs today must not send again."
