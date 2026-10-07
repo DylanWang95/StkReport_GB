@@ -2,9 +2,9 @@ name: US Stock Daily Report
 
 on:
   schedule:
-    # 美东时间 16:35：收盘后 35 分钟
-    # 北京时间：夏令时次日 04:35，冬令时次日 05:35
-    - cron: '35 16 * * 1-5'
+    # 美东时间 16:05：收盘后 05 分钟
+    # 北京时间：夏令时次日 04:05，冬令时次日 05:05
+    - cron: '05 16 * * 1-5'
       timezone: 'America/New_York'
   workflow_dispatch:
 
