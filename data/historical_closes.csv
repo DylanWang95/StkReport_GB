@@ -254,3 +254,9 @@ date,symbol,close,source
 2026-10-29,^GDAXI,26039.67969,yahoo_daily
 2026-10-29,^GSPC,7720.390137,yahoo_daily
 2026-10-29,^IXIC,26184.72461,yahoo_daily
+2026-10-30,^DJI,51770.30859,yahoo_daily
+2026-10-30,^FCHI,7969.419922,yahoo_daily
+2026-10-30,^FTSE,10729.78027,yahoo_daily
+2026-10-30,^GDAXI,25818.21094,yahoo_daily
+2026-10-30,^GSPC,7580.069824,yahoo_daily
+2026-10-30,^IXIC,25436.99805,yahoo_daily
