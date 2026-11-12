@@ -308,3 +308,9 @@ date,symbol,close,source
 2026-11-11,^GDAXI,26662.76953,yahoo_daily
 2026-11-11,^GSPC,7619.379883,yahoo_daily
 2026-11-11,^IXIC,25466.18945,yahoo_daily
+2026-11-12,^DJI,52297.08984,yahoo_daily
+2026-11-12,^FCHI,8361.360352,yahoo_daily
+2026-11-12,^FTSE,10863.08984,yahoo_daily
+2026-11-12,^GDAXI,26771.88086,yahoo_daily
+2026-11-12,^GSPC,7592.399902,yahoo_daily
+2026-11-12,^IXIC,25366.09375,yahoo_daily
