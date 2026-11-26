@@ -368,3 +368,6 @@ date,symbol,close,source
 2026-11-25,^GDAXI,24702.13086,yahoo_daily
 2026-11-25,^GSPC,7182.779785,yahoo_daily
 2026-11-25,^IXIC,23585.80273,yahoo_daily
+2026-11-26,^FCHI,8108.74,yahoo_quote
+2026-11-26,^FTSE,10609.2998,yahoo_daily
+2026-11-26,^GDAXI,25215.52,yahoo_quote
